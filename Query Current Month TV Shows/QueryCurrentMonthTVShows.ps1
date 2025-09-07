@@ -32,7 +32,7 @@ param(
     'https://en.wikipedia.org/wiki/List_of_programs_broadcast_by_FX',
     'https://en.wikipedia.org/wiki/List_of_programs_broadcast_by_AMC'
   ),
-  [string]$OutputCsv,
+  [string]$OutputCsv = "C:\Personal Scripts\CurrentMonthTVShows.csv",
   [int]$Year = 2025,
   [double]$MinRating = 8.4,
   [int]$MinVotes = 1000,
