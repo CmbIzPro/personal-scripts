@@ -1,37 +1,41 @@
 <#
 .SYNOPSIS
-  Scrape Title, Genre, Premiere from pre-"Upcoming original programming" wikitables on:
-  https://en.wikipedia.org/wiki/List_of_Netflix_original_programming
+  Combined scraper for “List of <Service> original programming” Wikipedia pages.
+  - Works with multiple URLs (e.g., Netflix + HBO)
+  - Skips rows in "Upcoming" section(s)
+  - Keeps rows where Premiere includes the target Year and a month/day (not year-only)
+  - IMDb: keeps only shows with Rating >= MinRating and Votes >= MinVotes,
+          OR includes rows with lookup failures ("IMDb not found" / "IMDb lookup error")
+  - Adds Network column (auto from URL)
+  - Sorts by Premiere ascending
 
-  Keep rows that:
-    - have Premiere in the target Year (default: 2025) AND include a month/date (exclude year-only entries)
-    - AND have IMDb rating >= MinRating AND votes >= MinVotes
-    - OR encountered an IMDb lookup failure (included with ImdbRating = "IMDb not found" / "IMDb lookup error")
-
-  Adds a "Network" column (auto-detected from URL; override with -Network).
+.OUTPUT
+  Objects with Title, Genre, Premiere, Network, ImdbRating
 #>
 
 [CmdletBinding()]
 param(
-  [string]$Url = 'https://en.wikipedia.org/wiki/List_of_Netflix_original_programming',
+  [string[]]$Urls = @(
+    'https://en.wikipedia.org/wiki/List_of_Netflix_original_programming',
+    'https://en.wikipedia.org/wiki/List_of_HBO_original_programming#Upcoming_programming'
+  ),
   [string]$OutputCsv,
   [int]$Year = 2025,
   [double]$MinRating = 8.4,
   [int]$MinVotes = 10000,
-  [int]$RequestDelayMs = 250,
-  [string]$Network    # optional override
+  [int]$RequestDelayMs = 250
 )
 
 function Remove-Html {
   param([string]$Html)
   if ([string]::IsNullOrWhiteSpace($Html)) { return $null }
   $s = $Html
-  $s = $s -replace '<sup[^>]*>.*?</sup>', ''                 # remove citation superscripts
+  $s = $s -replace '<sup[^>]*>.*?</sup>', ''                 # citation superscripts
   $s = $s -replace '<span[^>]*class="nowrap"[^>]*>', ''       # unwrap nowrap spans
-  $s = $s -replace '<br\s*/?>', '; '                          # convert <br> to separators
-  $s = $s -replace '<[^>]+>', ''                              # strip remaining tags
+  $s = $s -replace '<br\s*/?>', '; '                          # <br> => separator
+  $s = $s -replace '<[^>]+>', ''                              # strip tags
   $s = [System.Net.WebUtility]::HtmlDecode($s)                # decode entities
-  $s = $s -replace '\[\d+\]', ''                              # remove [1] markers
+  $s = $s -replace '\[\d+\]', ''                              # [1]
   $s = $s -replace '\s{2,}', ' '                              # collapse whitespace
   $s.Trim()
 }
@@ -79,18 +83,47 @@ function Get-NetworkFromUrlTitle {
   param([Parameter(Mandatory)][string]$Url)
   try {
     $u = [uri]$Url
-    $title = $u.Segments[-1]            # e.g., List_of_Netflix_original_programming
+    $title = $u.Segments[$u.Segments.Count-1]  # trailing segment
     $decoded = [System.Net.WebUtility]::UrlDecode($title) -replace '_',' '
-    # Match "List of <Service> original programming"
     $m = [regex]::Match($decoded, '^(?i)List of (.+?) original programming')
-    if ($m.Success) {
-      return $m.Groups[1].Value.Trim()
-    }
+    if ($m.Success) { return $m.Groups[1].Value.Trim() }
   } catch { }
   return $null
 }
 
-# --- Wikidata helpers (NEW) ---
+# --- Find where the “Upcoming” section begins for a given page ---
+function Get-CutoffIndex {
+  param([Parameter(Mandatory)][string]$Html, [string]$Url)
+
+  # Try common anchors/ids/text for different pages
+  $ids = @(
+    'Upcoming[_\s]original[_\s]programming',  # Netflix phrasing
+    'Upcoming[_\s]programming'                # HBO phrasing
+  )
+  foreach ($id in $ids) {
+    $re = [regex]::new('id\s*=\s*["'']' + $id + '["'']', 'IgnoreCase')
+    $m = $re.Match($Html)
+    if ($m.Success) { return $m.Index }
+  }
+  # Text fallback
+  $txts = @(
+    '>\s*Upcoming\s+original\s+programming\s*<',
+    '>\s*Upcoming\s+programming\s*<'
+  )
+  foreach ($pat in $txts) {
+    $re = [regex]::new($pat, 'IgnoreCase')
+    $m = $re.Match($Html)
+    if ($m.Success) { return $m.Index }
+  }
+  # Netflix-specific hard fallback: just before "The Abandons"
+  if ($Url -match 'Netflix') {
+    $ab = [regex]::Matches($Html, '(?i)The\s+Abandons')
+    if ($ab.Count -gt 0) { return $ab[$ab.Count-1].Index }
+  }
+  return -1
+}
+
+# --- Wikidata helpers ---
 function Get-WikiTitleFromHref {
   param([string]$Href)
   if ([string]::IsNullOrWhiteSpace($Href)) { return $null }
@@ -102,29 +135,21 @@ function Get-WikiTitleFromHref {
 }
 
 function Get-WikidataQidFromEnwikiTitle {
-  param(
-    [Parameter(Mandatory)][string]$EnwikiTitle,
-    [int]$DelayMs = 250
-  )
+  param([Parameter(Mandatory)][string]$EnwikiTitle,[int]$DelayMs=250)
   try {
     $api = "https://en.wikipedia.org/w/api.php?action=query&format=json&prop=pageprops&ppprop=wikibase_item&titles=" +
-            [System.Uri]::EscapeDataString($EnwikiTitle)
+           [System.Uri]::EscapeDataString($EnwikiTitle)
     Start-Sleep -Milliseconds $DelayMs
     $resp = Invoke-Http -Uri $api
     $j = $resp.Content | ConvertFrom-Json
     $page = ($j.query.pages.PSObject.Properties | Select-Object -First 1).Value
-    if ($page -and $page.pageprops -and $page.pageprops.wikibase_item) {
-      return $page.pageprops.wikibase_item
-    }
-  } catch { }
+    if ($page -and $page.pageprops -and $page.pageprops.wikibase_item) { return $page.pageprops.wikibase_item }
+  } catch {}
   return $null
 }
 
 function Get-ImdbIdFromWikidataQid {
-  param(
-    [Parameter(Mandatory)][string]$Qid,
-    [int]$DelayMs = 250
-  )
+  param([Parameter(Mandatory)][string]$Qid,[int]$DelayMs=250)
   try {
     $url = "https://www.wikidata.org/wiki/Special:EntityData/$Qid.json"
     Start-Sleep -Milliseconds $DelayMs
@@ -137,16 +162,13 @@ function Get-ImdbIdFromWikidataQid {
         if ($val -match '^tt\d+$') { return $val }
       }
     }
-  } catch { }
+  } catch {}
   return $null
 }
 
 # --- IMDb helpers ---
 function Try-GetImdbIdFromWikipediaPage {
-  param(
-    [Parameter(Mandatory)][string]$WikiHref,
-    [int]$DelayMs = 250
-  )
+  param([Parameter(Mandatory)][string]$WikiHref,[int]$DelayMs=250)
   try {
     $uri = $WikiHref
     if ($uri -notmatch '^https?://') { $uri = 'https://en.wikipedia.org' + $WikiHref }
@@ -154,22 +176,16 @@ function Try-GetImdbIdFromWikipediaPage {
     $resp = Invoke-Http -Uri $uri
     $m = [regex]::Match($resp.Content, '/title/(tt\d+)', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
     if ($m.Success) { return $m.Groups[1].Value }
-  } catch { }
+  } catch {}
   return $null
 }
 
 function Try-GetImdbIdFromWebSearch {
-  param(
-    [Parameter(Mandatory)][string]$Title,
-    [int]$PremiereYear,
-    [int]$DelayMs = 250
-  )
+  param([Parameter(Mandatory)][string]$Title,[int]$PremiereYear,[int]$DelayMs=250)
   $queries = @()
   $clean = Clean-TitleForSearch $Title
   if ($PremiereYear) { $queries += "$clean ($PremiereYear) site:imdb.com/title" }
-  $queries += "$clean Netflix site:imdb.com/title"
   $queries += "$clean site:imdb.com/title"
-
   foreach ($q in $queries) {
     $enc = [System.Uri]::EscapeDataString($q)
     foreach ($engine in @('bing','ddg')) {
@@ -186,7 +202,8 @@ function Try-GetImdbIdFromWebSearch {
 }
 
 function Get-ImdbRating {
-  param([Parameter(Mandatory)] [string]$ImdbId)
+  <# Returns @{Status='ok'; Id; Rating; Votes} or @{Status='not_found'} or @{Status='error'} #>
+  param([Parameter(Mandatory)][string]$ImdbId)
   try {
     $titleUrl = "https://www.imdb.com/title/$ImdbId/"
     $resp = Invoke-Http -Uri $titleUrl
@@ -199,9 +216,7 @@ function Get-ImdbRating {
         $objs = @()
         if ($j -is [System.Collections.IEnumerable] -and -not ($j -is [string])) { $objs = $j } else { $objs = @($j) }
         foreach ($o in $objs) {
-          if ($o.aggregateRating -and $o.aggregateRating.ratingValue -and $o.aggregateRating.ratingCount) {
-            $best = $o; break
-          }
+          if ($o.aggregateRating -and $o.aggregateRating.ratingValue -and $o.aggregateRating.ratingCount) { $best = $o; break }
         }
         if ($best) { break }
       } catch { continue }
@@ -220,7 +235,7 @@ function Get-ImdbRating {
 function Get-ImdbAssessment {
   <#
     Returns one of:
-      @{ Status='ok';       Id='tt....'; Rating=[double]; Votes=[int] }
+      @{ Status='ok';       Id='tt…'; Rating=[double]; Votes=[int] }
       @{ Status='not_found' }
       @{ Status='error' }
     Tries, in order:
@@ -228,7 +243,7 @@ function Get-ImdbAssessment {
       2) IMDb find
       3) Wikidata P345 (via enwiki title or page link)
       4) Wikipedia page external IMDb link
-      5) Web search (Bing, DuckDuckGo)
+      5) Web search (Bing/DuckDuckGo)
   #>
   param(
     [Parameter(Mandatory)] [string]$Title,
@@ -253,7 +268,7 @@ function Get-ImdbAssessment {
             if ($PremiereYear -and $d.y -eq $PremiereYear) { $score += 3 }
             elseif ($PremiereYear -and $d.yr -and ($d.yr -match [regex]::Escape("$PremiereYear"))) { $score += 2 }
             if ($d.q -match '(?i)TV') { $score += 1 }
-            [pscustomobject]@{ Id = $d.id; Score = $score }
+            [pscustomobject]@{ Id=$d.id; Score=$score }
           }
           if ($scored) {
             $ttId = ($scored | Sort-Object Score -Descending | Select-Object -First 1).Id
@@ -294,163 +309,182 @@ function Get-ImdbAssessment {
     if ($tt4) { Start-Sleep -Milliseconds $DelayMs; return Get-ImdbRating -ImdbId $tt4 }
 
     return @{ Status='not_found' }
-  }
-  catch {
+  } catch {
     return @{ Status='error' }
   }
 }
 
-# --- Download the Wikipedia HTML ---
-try {
-  try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
-  $resp = Invoke-Http -Uri $Url
-  $html = $resp.Content
-}
-catch {
-  throw "Failed to download $Url. $_"
+# Parse Premiere into a sortable DateTime key
+function Get-PremiereSortKey {
+  param([string]$Premiere)
+  $fallback = [DateTime]::MaxValue
+  if ([string]::IsNullOrWhiteSpace($Premiere)) { return $fallback }
+  $s = ($Premiere -split ';')[0].Trim()
+  $s = ($s -split '[–—]')[0].Trim()
+  $culture = [System.Globalization.CultureInfo]::GetCultureInfo('en-US')
+  $styles  = [System.Globalization.DateTimeStyles]::AssumeLocal
+
+  $m = [regex]::Match($s, '\b\d{4}-\d{2}-\d{2}\b')
+  if ($m.Success) { $dt=[datetime]::MinValue; if ([datetime]::TryParseExact($m.Value,'yyyy-MM-dd',$culture,$styles,[ref]$dt)) { return $dt } }
+
+  $m = [regex]::Match($s, '\b\d{1,2}/\d{1,2}/\d{4}\b')
+  if ($m.Success) { $dt=[datetime]::MinValue; if ([datetime]::TryParse($m.Value,$culture,$styles,[ref]$dt)) { return $dt } }
+
+  $dt2=[datetime]::MinValue
+  if ([datetime]::TryParse($s,$culture,$styles,[ref]$dt2)) { return $dt2 }
+
+  $m = [regex]::Match($s,'^(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})$','IgnoreCase')
+  if ($m.Success) {
+    $first = ('{0} 1, {1}' -f $m.Groups[1].Value, $m.Groups[2].Value)
+    $dt3=[datetime]::MinValue
+    if ([datetime]::TryParse($first,$culture,$styles,[ref]$dt3)) { return $dt3 }
+  }
+  return $fallback
 }
 
-# Determine network/service name
-$networkName = if ($Network) {
-  $Network
-} else {
-  $auto = Get-NetworkFromUrlTitle -Url $Url
-  if ($auto) { $auto } else { 'Netflix' }
-}
+# --- Main scrape across one or more URLs ---
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
 
-# --- Regexes for Wikipedia tables and headers ---
 $tableRe = [regex]::new('<table[^>]*class="[^"]*wikitable[^"]*"[^>]*>.*?<\/table>', 'IgnoreCase,Singleline')
 $trRe    = [regex]::new('<tr[^>]*>.*?<\/tr>', 'IgnoreCase,Singleline')
 $thRe    = [regex]::new('<th\b[^>]*>(.*?)<\/th>', 'IgnoreCase,Singleline')
 $cellRe  = [regex]::new('(<td\b[^>]*>.*?<\/td>)|(<th\b[^>]*\bscope\s*=\s*["'']row["''][^>]*>.*?<\/th>)', 'IgnoreCase,Singleline')
 
-# --- Find cutoff index for "Upcoming original programming" (or fallback to "The Abandons") ---
-$cutoffIdx = -1
-$upcomingIdRe   = [regex]::new('id\s*=\s*["'']Upcoming[_\s]original[_\s]programming["'']', 'IgnoreCase')
-$u = $upcomingIdRe.Match($html)
-if (-not $u.Success) {
-  $upcomingTextRe = [regex]::new('>\s*Upcoming\s+original\s+programming\s*<', 'IgnoreCase')
-  $u = $upcomingTextRe.Match($html)
-}
-if ($u.Success) {
-  $cutoffIdx = $u.Index
-} else {
-  $abMatches = [regex]::Matches($html, '(?i)The\s+Abandons')
-  if ($abMatches.Count -gt 0) { $cutoffIdx = $abMatches[$abMatches.Count-1].Index }
-}
-
-# Patterns for year/month filtering
 $yearPattern    = "\b$Year\b"
 $monthPattern   = '(?i)\b(January|Jan|February|Feb|March|Mar|April|Apr|May|June|Jun|July|Jul|August|Aug|September|Sept|Sep|October|Oct|November|Nov|December|Dec)\b'
 $isoDatePattern = '\b\d{4}-\d{2}-\d{2}\b'
 $usDatePattern  = '\b\d{1,2}/\d{1,2}/\d{4}\b'
 
-# Caches
 $imdbCache = @{}
 $results = New-Object System.Collections.Generic.List[object]
 
-foreach ($t in $tableRe.Matches($html)) {
-  if ($cutoffIdx -ge 0 -and $t.Index -ge $cutoffIdx) { continue }  # skip "Upcoming" and after
-
-  $tableHtml = $t.Value
-
-  # Identify header row
-  $headerRow = $null
-  foreach ($tr in $trRe.Matches($tableHtml)) {
-    if ($tr.Value -match '<th\b' -and -not ($tr.Value -match 'scope\s*=\s*["'']row["'']')) { $headerRow = $tr.Value; break }
-  }
-  if (-not $headerRow) { continue }
-
-  # Extract headers
-  $headers = @()
-  foreach ($m in $thRe.Matches($headerRow)) {
-    $h = Remove-Html $m.Groups[1].Value
-    if ($h) { $headers += $h }
-  }
-  if (-not $headers) { continue }
-
-  # Column indexes
-  $findIndex = {
-    param($pattern)
-    for ($i=0; $i -lt $headers.Count; $i++) { if ($headers[$i] -match $pattern) { return $i } }
-    return -1
+foreach ($Url in $Urls) {
+  # Download
+  try {
+    $resp = Invoke-Http -Uri $Url
+    $html = $resp.Content
+  } catch {
+    Write-Warning "Failed to download $($Url): $($_.Exception.Message)"
+    continue
   }
 
-  $idxTitle    = & $findIndex '^(?i)\s*(title|program(me)?|show)\s*$'
-  $idxGenre    = & $findIndex '(?i)^\s*genre(s)?\s*$'
-  $idxPremiere = & $findIndex '(?i)premiere(d)?|original\s*release|release\s*date|first\s*(aired|released)'
-  if ($idxTitle -lt 0 -or $idxGenre -lt 0 -or $idxPremiere -lt 0) { continue }
+  # Determine network/service name
+  $networkName = Get-NetworkFromUrlTitle -Url $Url
+  if (-not $networkName) {
+    if ($Url -match '(?i)netflix') { $networkName = 'Netflix' }
+    elseif ($Url -match '(?i)hbo') { $networkName = 'HBO' }
+    else { $networkName = 'Unknown' }
+  }
 
-  $highestIdx = [Math]::Max([Math]::Max($idxTitle, $idxGenre), $idxPremiere)
+  # Cutoff for Upcoming
+  $cutoffIdx = Get-CutoffIndex -Html $html -Url $Url
 
-  foreach ($tr in $trRe.Matches($tableHtml)) {
-    if ($tr.Value -match '<th\b' -and -not ($tr.Value -match 'scope\s*=\s*["'']row["'']')) { continue }
+  foreach ($t in $tableRe.Matches($html)) {
+    if ($cutoffIdx -ge 0 -and $t.Index -ge $cutoffIdx) { continue }  # skip "Upcoming" and after
 
-    # Cells (raw + cleaned)
-    $rawCells = @()
-    $cells = @()
-    foreach ($cm in $cellRe.Matches($tr.Value)) {
-      $innerRaw = $cm.Value -replace '^<td\b[^>]*>|^<th\b[^>]*>',''
-      $innerRaw = $innerRaw -replace '</td>$|</th>$',''
-      $rawCells += ,$innerRaw
-      $cells    += ,(Remove-Html $innerRaw)
+    $tableHtml = $t.Value
+
+    # Header row
+    $headerRow = $null
+    foreach ($tr in $trRe.Matches($tableHtml)) {
+      if ($tr.Value -match '<th\b' -and -not ($tr.Value -match 'scope\s*=\s*["'']row["'']')) { $headerRow = $tr.Value; break }
     }
-    if (-not $cells -or $cells.Count -lt ($highestIdx + 1)) { continue }
+    if (-not $headerRow) { continue }
 
-    $title    = $cells[$idxTitle]
-    $genre    = $cells[$idxGenre]
-    $premiere = $cells[$idxPremiere]
-    if ([string]::IsNullOrWhiteSpace($title) -or [string]::IsNullOrWhiteSpace($premiere)) { continue }
+    # Headers
+    $headers = @()
+    foreach ($m in $thRe.Matches($headerRow)) {
+      $h = Remove-Html $m.Groups[1].Value
+      if ($h) { $headers += $h }
+    }
+    if (-not $headers) { continue }
 
-    # Grab Title cell's Wikipedia href (first anchor)
-    $titleHref = $null
-    if ($idxTitle -lt $rawCells.Count) {
-      $mHref = [regex]::Match($rawCells[$idxTitle], '<a[^>]+href="([^"#:]+)"', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-      if ($mHref.Success) { $titleHref = $mHref.Groups[1].Value }
+    # Column indexes
+    $findIndex = {
+      param($pattern)
+      for ($i=0; $i -lt $headers.Count; $i++) { if ($headers[$i] -match $pattern) { return $i } }
+      return -1
     }
 
-    # Wikipedia-side filter: year + month/date required
-    $hasYear        = ($premiere -match $yearPattern)
-    $hasMonthOrDate = ($premiere -match $monthPattern) -or ($premiere -match $isoDatePattern) -or ($premiere -match $usDatePattern)
-    if (-not ($hasYear -and $hasMonthOrDate)) { continue }
+    $idxTitle    = & $findIndex '^(?i)\s*(title|program(me)?|show)\s*$'
+    $idxGenre    = & $findIndex '(?i)^\s*genre(s)?\s*$'
+    $idxPremiere = & $findIndex '(?i)premiere(d)?|original\s*release|release\s*date|first\s*(aired|released)'
+    if ($idxTitle -lt 0 -or $idxGenre -lt 0 -or $idxPremiere -lt 0) { continue }
 
-    # IMDb lookup (cached by Title)
-    $premYear = Get-FirstYearFromText $premiere
-    if (-not $imdbCache.ContainsKey($title)) {
-      $imdbCache[$title] = Get-ImdbAssessment -Title $title -PremiereYear $premYear -DelayMs $RequestDelayMs -TitleHref $titleHref
-    }
-    $assessment = $imdbCache[$title]
+    $highestIdx = [Math]::Max([Math]::Max($idxTitle, $idxGenre), $idxPremiere)
 
-    if ($assessment.Status -eq 'ok') {
-      if ($assessment.Rating -ge $MinRating -and $assessment.Votes -ge $MinVotes) {
+    foreach ($tr in $trRe.Matches($tableHtml)) {
+      if ($tr.Value -match '<th\b' -and -not ($tr.Value -match 'scope\s*=\s*["'']row["'']')) { continue }
+
+      # Cells (raw + cleaned)
+      $rawCells = @()
+      $cells = @()
+      foreach ($cm in $cellRe.Matches($tr.Value)) {
+        $innerRaw = $cm.Value -replace '^<td\b[^>]*>|^<th\b[^>]*>',''
+        $innerRaw = $innerRaw -replace '</td>$|</th>$',''
+        $rawCells += ,$innerRaw
+        $cells    += ,(Remove-Html $innerRaw)
+      }
+      if (-not $cells -or $cells.Count -lt ($highestIdx + 1)) { continue }
+
+      $title    = $cells[$idxTitle]
+      $genre    = $cells[$idxGenre]
+      $premiere = $cells[$idxPremiere]
+      if ([string]::IsNullOrWhiteSpace($title) -or [string]::IsNullOrWhiteSpace($premiere)) { continue }
+
+      # Title cell's Wikipedia href (first anchor)
+      $titleHref = $null
+      if ($idxTitle -lt $rawCells.Count) {
+        $mHref = [regex]::Match($rawCells[$idxTitle], '<a[^>]+href="([^"#:]+)"', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+        if ($mHref.Success) { $titleHref = $mHref.Groups[1].Value }
+      }
+
+      # Wikipedia-side filter: year + month/date required
+      $hasYear        = ($premiere -match $yearPattern)
+      $hasMonthOrDate = ($premiere -match $monthPattern) -or ($premiere -match $isoDatePattern) -or ($premiere -match $usDatePattern)
+      if (-not ($hasYear -and $hasMonthOrDate)) { continue }
+
+      # IMDb lookup (cached by Title within this run)
+      $premYear = Get-FirstYearFromText $premiere
+      if (-not $imdbCache.ContainsKey($title)) {
+        $imdbCache[$title] = Get-ImdbAssessment -Title $title -PremiereYear $premYear -DelayMs $RequestDelayMs -TitleHref $titleHref
+      }
+      $assessment = $imdbCache[$title]
+
+      if ($assessment.Status -eq 'ok') {
+        if ($assessment.Rating -ge $MinRating -and $assessment.Votes -ge $MinVotes) {
+          $results.Add([pscustomobject]@{
+            Title      = $title
+            Genre      = $genre
+            Premiere   = $premiere
+            Network    = $networkName
+            ImdbRating = [math]::Round($assessment.Rating, 1)
+          }) | Out-Null
+        }
+      }
+      elseif ($assessment.Status -in @('not_found','error')) {
+        $label = if ($assessment.Status -eq 'not_found') { 'IMDb not found' } else { 'IMDb lookup error' }
         $results.Add([pscustomobject]@{
           Title      = $title
           Genre      = $genre
           Premiere   = $premiere
           Network    = $networkName
-          ImdbRating = [math]::Round($assessment.Rating, 1)
+          ImdbRating = $label
         }) | Out-Null
       }
-    }
-    elseif ($assessment.Status -in @('not_found','error')) {
-      $label = if ($assessment.Status -eq 'not_found') { 'IMDb not found' } else { 'IMDb lookup error' }
-      $results.Add([pscustomobject]@{
-        Title      = $title
-        Genre      = $genre
-        Premiere   = $premiere
-        Network    = $networkName
-        ImdbRating = $label
-      }) | Out-Null
     }
   }
 }
 
+# Sort by Premiere ascending (then Title)
+$sorted = $results | Sort-Object @{ Expression = { Get-PremiereSortKey $_.Premiere } }, @{ Expression = 'Title' }
+
 # Emit results and optionally save
-$results
+$sorted
 
 if ($OutputCsv) {
   $dir = Split-Path -Parent $OutputCsv
   if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
-  $results | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $OutputCsv
-  Write-Host "Saved $($results.Count) rows to $OutputCsv"
+  $sorted | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $OutputCsv
+  Write-Host "Saved $($sorted.Count) rows to $OutputCsv"
 }
