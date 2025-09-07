@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
   Combined scraper for “List of <Service> original programming” Wikipedia pages.
-  - Works with multiple URLs (e.g., Netflix + HBO + HBO Max)
+  - Works with multiple URLs (e.g., Netflix + HBO + HBO Max + Apple TV+)
   - Skips rows in "Upcoming" section(s)
   - Keeps rows where Premiere includes the target Year and a month/day (not year-only)
   - IMDb: by default keeps only shows with Rating >= MinRating and Votes >= MinVotes
@@ -19,12 +19,13 @@ param(
   [string[]]$Urls = @(
     'https://en.wikipedia.org/wiki/List_of_Netflix_original_programming',
     'https://en.wikipedia.org/wiki/List_of_HBO_original_programming#Upcoming_programming',
-    'https://en.wikipedia.org/wiki/List_of_HBO_Max_original_programming'
+    'https://en.wikipedia.org/wiki/List_of_HBO_Max_original_programming',
+    'https://en.wikipedia.org/wiki/List_of_Apple_TV%2B_original_programming'
   ),
   [string]$OutputCsv,
   [int]$Year = 2025,
   [double]$MinRating = 8.4,
-  [int]$MinVotes = 10000,
+  [int]$MinVotes = 1000,
   [int]$RequestDelayMs = 250,
   [switch]$IncludeBelowThreshold
 )
@@ -101,7 +102,7 @@ function Get-CutoffIndex {
   # Try common anchors/ids/text for different pages
   $ids = @(
     'Upcoming[_\s]original[_\s]programming',  # Netflix phrasing
-    'Upcoming[_\s]programming'                # HBO/HBO Max phrasing
+    'Upcoming[_\s]programming'                # HBO/HBO Max/Apple TV+ phrasing
   )
   foreach ($id in $ids) {
     $re = [regex]::new('id\s*=\s*["'']' + $id + '["'']', 'IgnoreCase')
@@ -190,11 +191,25 @@ function Try-GetImdbIdFromWebSearch {
     [int]$DelayMs=250,
     [string]$NetworkHint
   )
+
   $queries = @()
   $clean = Clean-TitleForSearch $Title
   if ($PremiereYear) { $queries += "$clean ($PremiereYear) site:imdb.com/title" }
-  if ($NetworkHint)   { $queries += "$clean `"$NetworkHint`" site:imdb.com/title" }
+
+  if ($NetworkHint) {
+    # Include network hint and common synonyms (e.g., "Apple TV+" -> "Apple TV Plus", "HBO Max" -> "Max")
+    $hints = New-Object System.Collections.Generic.List[string]
+    $hints.Add($NetworkHint)
+    if ($NetworkHint -match '(?i)Apple\s*TV\+') { $hints.Add(($NetworkHint -replace '\+',' Plus')) }
+    if ($NetworkHint -match '(?i)\bHBO Max\b') { $hints.Add('Max') }
+
+    foreach ($h in $hints) {
+      $queries += "$clean `"$h`" site:imdb.com/title"
+    }
+  }
+
   $queries += "$clean site:imdb.com/title"
+
   foreach ($q in $queries) {
     $enc = [System.Uri]::EscapeDataString($q)
     foreach ($engine in @('bing','ddg')) {
@@ -384,6 +399,8 @@ foreach ($Url in $Urls) {
     if     ($Url -match '(?i)hbo[_\s]*max') { $networkName = 'HBO Max' }
     elseif ($Url -match '(?i)hbo')         { $networkName = 'HBO' }
     elseif ($Url -match '(?i)netflix')     { $networkName = 'Netflix' }
+    elseif ($Url -match '(?i)apple.*tv(\+|%2B)') { $networkName = 'Apple TV+' }
+    elseif ($Url -match '(?i)apple')       { $networkName = 'Apple TV+' }
     else                                   { $networkName = 'Unknown' }
   }
 
@@ -455,12 +472,13 @@ foreach ($Url in $Urls) {
       $hasMonthOrDate = ($premiere -match $monthPattern) -or ($premiere -match $isoDatePattern) -or ($premiere -match $usDatePattern)
       if (-not ($hasYear -and $hasMonthOrDate)) { continue }
 
-      # IMDb lookup (cached by Title within this run)
+      # IMDb lookup (cached per-network+title to avoid cross-collisions)
       $premYear = Get-FirstYearFromText $premiere
-      if (-not $imdbCache.ContainsKey($title)) {
-        $imdbCache[$title] = Get-ImdbAssessment -Title $title -PremiereYear $premYear -DelayMs $RequestDelayMs -TitleHref $titleHref -NetworkHint $networkName
+      $cacheKey = "$networkName|$title"
+      if (-not $imdbCache.ContainsKey($cacheKey)) {
+        $imdbCache[$cacheKey] = Get-ImdbAssessment -Title $title -PremiereYear $premYear -DelayMs $RequestDelayMs -TitleHref $titleHref -NetworkHint $networkName
       }
-      $assessment = $imdbCache[$title]
+      $assessment = $imdbCache[$cacheKey]
 
       if ($assessment.Status -eq 'ok') {
         $meets = ($assessment.Rating -ge $MinRating -and $assessment.Votes -ge $MinVotes)
