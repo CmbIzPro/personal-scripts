@@ -516,8 +516,14 @@ foreach ($Url in $Urls) {
   }
 }
 
-# Sort by Premiere ascending (then Title)
-$sorted = $results | Sort-Object @{ Expression = { Get-PremiereSortKey $_.Premiere } }, @{ Expression = 'Title' }
+# Sort by IMDb rating descending (numeric first; not-found/errors at bottom)
+$sorted = $results | Sort-Object -Property @{
+  Expression = {
+    $num = 0.0
+    if ([double]::TryParse($_.ImdbRating, [ref]$num)) { $num } else { -1 }
+  }
+} -Descending
+
 
 # Emit results and optionally save
 $sorted
