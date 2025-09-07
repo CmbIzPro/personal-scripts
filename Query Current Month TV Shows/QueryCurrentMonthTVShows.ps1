@@ -1,13 +1,15 @@
 <#
 .SYNOPSIS
   Combined scraper for “List of <Service> original programming” Wikipedia pages.
-  - Works with multiple URLs (e.g., Netflix + HBO + HBO Max + Apple TV+)
+  - Works with multiple URLs (Netflix + HBO + HBO Max + Apple TV+ + others)
   - Skips rows in "Upcoming" section(s)
-  - Keeps rows where Premiere includes the target Year and a month/day (not year-only)
+  - Default filter: Premiere is in the target Year AND includes a month/day (not year-only)
+  - Optional filter: -OnlyTwoMonthsAgoMonth limits to the entire month from two months ago
+    (e.g., if current month is September, only July 1 – July 31)
   - IMDb: by default keeps only shows with Rating >= MinRating and Votes >= MinVotes
           OR includes rows with lookup failures ("IMDb not found" / "IMDb lookup error")
   - Adds Network column (auto from URL)
-  - Sorts by Premiere ascending
+  - Sorts by IMDb rating descending (not-found/errors at bottom)
   - -IncludeBelowThreshold switch includes titles that have IMDb but are below thresholds
 
 .OUTPUT
@@ -37,7 +39,8 @@ param(
   [double]$MinRating = 8.4,
   [int]$MinVotes = 1000,
   [int]$RequestDelayMs = 250,
-  [switch]$IncludeBelowThreshold
+  [switch]$IncludeBelowThreshold,
+  [switch]$OnlyTwoMonthsAgoMonth   # NEW: restrict to the full month two months ago
 )
 
 function Remove-Html {
@@ -201,18 +204,16 @@ function Try-GetImdbIdFromWebSearch {
     [int]$DelayMs=250,
     [string]$NetworkHint
   )
-
   $queries = @()
   $clean = Clean-TitleForSearch $Title
   if ($PremiereYear) { $queries += "$clean ($PremiereYear) site:imdb.com/title" }
 
   if ($NetworkHint) {
-    # Include network hint and common synonyms (e.g., "Apple TV+" -> "Apple TV Plus", "HBO Max" -> "Max")
+    # Include network hint and common synonyms
     $hints = New-Object System.Collections.Generic.List[string]
     $hints.Add($NetworkHint)
     if ($NetworkHint -match '(?i)Apple\s*TV\+') { $hints.Add(($NetworkHint -replace '\+',' Plus')) }
     if ($NetworkHint -match '(?i)\bHBO Max\b') { $hints.Add('Max') }
-
     foreach ($h in $hints) {
       $queries += "$clean `"$h`" site:imdb.com/title"
     }
@@ -349,11 +350,10 @@ function Get-ImdbAssessment {
   }
 }
 
-# Parse Premiere into a sortable DateTime key
-function Get-PremiereSortKey {
+# Parse Premiere into a sortable/usable DateTime (first date found in the cell)
+function Get-PremiereDate {
   param([string]$Premiere)
-  $fallback = [DateTime]::MaxValue
-  if ([string]::IsNullOrWhiteSpace($Premiere)) { return $fallback }
+  if ([string]::IsNullOrWhiteSpace($Premiere)) { return $null }
   $s = ($Premiere -split ';')[0].Trim()
   $s = ($s -split '[–—]')[0].Trim()
   $culture = [System.Globalization.CultureInfo]::GetCultureInfo('en-US')
@@ -374,7 +374,7 @@ function Get-PremiereSortKey {
     $dt3=[datetime]::MinValue
     if ([datetime]::TryParse($first,$culture,$styles,[ref]$dt3)) { return $dt3 }
   }
-  return $fallback
+  return $null
 }
 
 # --- Main scrape across one or more URLs ---
@@ -389,6 +389,15 @@ $yearPattern    = "\b$Year\b"
 $monthPattern   = '(?i)\b(January|Jan|February|Feb|March|Mar|April|Apr|May|June|Jun|July|Jul|August|Aug|September|Sept|Sep|October|Oct|November|Nov|December|Dec)\b'
 $isoDatePattern = '\b\d{4}-\d{2}-\d{2}\b'
 $usDatePattern  = '\b\d{1,2}/\d{1,2}/\d{4}\b'
+
+# Compute optional "two months ago" window
+$windowStart = $null
+$windowEndExclusive = $null
+if ($OnlyTwoMonthsAgoMonth) {
+  $firstThisMonth = Get-Date -Day 1
+  $windowStart = $firstThisMonth.AddMonths(-2)            # first day of month two months ago
+  $windowEndExclusive = $windowStart.AddMonths(1)         # exclusive
+}
 
 $imdbCache = @{}
 $results = New-Object System.Collections.Generic.List[object]
@@ -406,12 +415,20 @@ foreach ($Url in $Urls) {
   # Determine network/service name
   $networkName = Get-NetworkFromUrlTitle -Url $Url
   if (-not $networkName) {
-    if     ($Url -match '(?i)hbo[_\s]*max') { $networkName = 'HBO Max' }
-    elseif ($Url -match '(?i)hbo')         { $networkName = 'HBO' }
-    elseif ($Url -match '(?i)netflix')     { $networkName = 'Netflix' }
-    elseif ($Url -match '(?i)apple.*tv(\+|%2B)') { $networkName = 'Apple TV+' }
-    elseif ($Url -match '(?i)apple')       { $networkName = 'Apple TV+' }
-    else                                   { $networkName = 'Unknown' }
+    if     ($Url -match '(?i)hbo[_\s]*max')                 { $networkName = 'HBO Max' }
+    elseif ($Url -match '(?i)hbo')                          { $networkName = 'HBO' }
+    elseif ($Url -match '(?i)netflix')                      { $networkName = 'Netflix' }
+    elseif ($Url -match '(?i)apple.*tv(\+|%2B)')            { $networkName = 'Apple TV+' }
+    elseif ($Url -match '(?i)paramount(\+|%2B)')            { $networkName = 'Paramount+' }
+    elseif ($Url -match '(?i)disney(\+|%2B)')               { $networkName = 'Disney+' }
+    elseif ($Url -match '(?i)hulu')                         { $networkName = 'Hulu' }
+    elseif ($Url -match '(?i)peacock')                      { $networkName = 'Peacock' }
+    elseif ($Url -match '(?i)amazon|prime\s*video')         { $networkName = 'Prime Video' }
+    elseif ($Url -match '(?i)mgm(\+|%2B)')                  { $networkName = 'MGM+' }
+    elseif ($Url -match '(?i)discovery(\+|%2B)')            { $networkName = 'Discovery+' }
+    elseif ($Url -match '(?i)\bFX\b')                       { $networkName = 'FX' }
+    elseif ($Url -match '(?i)\bAMC\b')                      { $networkName = 'AMC' }
+    else                                                    { $networkName = 'Unknown' }
   }
 
   # Cutoff for Upcoming
@@ -477,13 +494,21 @@ foreach ($Url in $Urls) {
         if ($mHref.Success) { $titleHref = $mHref.Groups[1].Value }
       }
 
-      # Wikipedia-side filter: year + month/date required
-      $hasYear        = ($premiere -match $yearPattern)
-      $hasMonthOrDate = ($premiere -match $monthPattern) -or ($premiere -match $isoDatePattern) -or ($premiere -match $usDatePattern)
-      if (-not ($hasYear -and $hasMonthOrDate)) { continue }
+      # Date filters
+      $premDate = Get-PremiereDate $premiere
+
+      if ($OnlyTwoMonthsAgoMonth) {
+        if (-not $premDate) { continue }
+        if ($premDate -lt $windowStart -or $premDate -ge $windowEndExclusive) { continue }
+      } else {
+        # Default behavior: year + month/date present
+        $hasYear        = ($premiere -match $yearPattern)
+        $hasMonthOrDate = ($premiere -match $monthPattern) -or ($premiere -match $isoDatePattern) -or ($premiere -match $usDatePattern)
+        if (-not ($hasYear -and $hasMonthOrDate)) { continue }
+      }
 
       # IMDb lookup (cached per-network+title to avoid cross-collisions)
-      $premYear = Get-FirstYearFromText $premiere
+      $premYear = if ($premDate) { $premDate.Year } else { Get-FirstYearFromText $premiere }
       $cacheKey = "$networkName|$title"
       if (-not $imdbCache.ContainsKey($cacheKey)) {
         $imdbCache[$cacheKey] = Get-ImdbAssessment -Title $title -PremiereYear $premYear -DelayMs $RequestDelayMs -TitleHref $titleHref -NetworkHint $networkName
@@ -523,7 +548,6 @@ $sorted = $results | Sort-Object -Property @{
     if ([double]::TryParse($_.ImdbRating, [ref]$num)) { $num } else { -1 }
   }
 } -Descending
-
 
 # Emit results and optionally save
 $sorted
