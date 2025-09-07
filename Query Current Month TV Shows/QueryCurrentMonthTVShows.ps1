@@ -1,13 +1,14 @@
 <#
 .SYNOPSIS
   Combined scraper for “List of <Service> original programming” Wikipedia pages.
-  - Works with multiple URLs (e.g., Netflix + HBO)
+  - Works with multiple URLs (e.g., Netflix + HBO + HBO Max)
   - Skips rows in "Upcoming" section(s)
   - Keeps rows where Premiere includes the target Year and a month/day (not year-only)
-  - IMDb: keeps only shows with Rating >= MinRating and Votes >= MinVotes,
+  - IMDb: by default keeps only shows with Rating >= MinRating and Votes >= MinVotes
           OR includes rows with lookup failures ("IMDb not found" / "IMDb lookup error")
   - Adds Network column (auto from URL)
   - Sorts by Premiere ascending
+  - -IncludeBelowThreshold switch includes titles that have IMDb but are below thresholds
 
 .OUTPUT
   Objects with Title, Genre, Premiere, Network, ImdbRating
@@ -17,13 +18,15 @@
 param(
   [string[]]$Urls = @(
     'https://en.wikipedia.org/wiki/List_of_Netflix_original_programming',
-    'https://en.wikipedia.org/wiki/List_of_HBO_original_programming#Upcoming_programming'
+    'https://en.wikipedia.org/wiki/List_of_HBO_original_programming#Upcoming_programming',
+    'https://en.wikipedia.org/wiki/List_of_HBO_Max_original_programming'
   ),
   [string]$OutputCsv,
   [int]$Year = 2025,
   [double]$MinRating = 8.4,
   [int]$MinVotes = 10000,
-  [int]$RequestDelayMs = 250
+  [int]$RequestDelayMs = 250,
+  [switch]$IncludeBelowThreshold
 )
 
 function Remove-Html {
@@ -98,7 +101,7 @@ function Get-CutoffIndex {
   # Try common anchors/ids/text for different pages
   $ids = @(
     'Upcoming[_\s]original[_\s]programming',  # Netflix phrasing
-    'Upcoming[_\s]programming'                # HBO phrasing
+    'Upcoming[_\s]programming'                # HBO/HBO Max phrasing
   )
   foreach ($id in $ids) {
     $re = [regex]::new('id\s*=\s*["'']' + $id + '["'']', 'IgnoreCase')
@@ -181,10 +184,16 @@ function Try-GetImdbIdFromWikipediaPage {
 }
 
 function Try-GetImdbIdFromWebSearch {
-  param([Parameter(Mandatory)][string]$Title,[int]$PremiereYear,[int]$DelayMs=250)
+  param(
+    [Parameter(Mandatory)][string]$Title,
+    [int]$PremiereYear,
+    [int]$DelayMs=250,
+    [string]$NetworkHint
+  )
   $queries = @()
   $clean = Clean-TitleForSearch $Title
   if ($PremiereYear) { $queries += "$clean ($PremiereYear) site:imdb.com/title" }
+  if ($NetworkHint)   { $queries += "$clean `"$NetworkHint`" site:imdb.com/title" }
   $queries += "$clean site:imdb.com/title"
   foreach ($q in $queries) {
     $enc = [System.Uri]::EscapeDataString($q)
@@ -243,13 +252,14 @@ function Get-ImdbAssessment {
       2) IMDb find
       3) Wikidata P345 (via enwiki title or page link)
       4) Wikipedia page external IMDb link
-      5) Web search (Bing/DuckDuckGo)
+      5) Web search (Bing/DuckDuckGo) with optional Network hint
   #>
   param(
     [Parameter(Mandatory)] [string]$Title,
     [int]$PremiereYear,
     [int]$DelayMs = 250,
-    [string]$TitleHref
+    [string]$TitleHref,
+    [string]$NetworkHint
   )
 
   try {
@@ -305,7 +315,7 @@ function Get-ImdbAssessment {
       if ($tt3) { Start-Sleep -Milliseconds $DelayMs; return Get-ImdbRating -ImdbId $tt3 }
     }
 
-    $tt4 = Try-GetImdbIdFromWebSearch -Title $Title -PremiereYear $PremiereYear -DelayMs $DelayMs
+    $tt4 = Try-GetImdbIdFromWebSearch -Title $Title -PremiereYear $PremiereYear -DelayMs $DelayMs -NetworkHint $NetworkHint
     if ($tt4) { Start-Sleep -Milliseconds $DelayMs; return Get-ImdbRating -ImdbId $tt4 }
 
     return @{ Status='not_found' }
@@ -364,16 +374,17 @@ foreach ($Url in $Urls) {
     $resp = Invoke-Http -Uri $Url
     $html = $resp.Content
   } catch {
-    Write-Warning "Failed to download $($Url): $($_.Exception.Message)"
+    Write-Warning ("Failed to download {0}: {1}" -f $Url, $_.Exception.Message)
     continue
   }
 
   # Determine network/service name
   $networkName = Get-NetworkFromUrlTitle -Url $Url
   if (-not $networkName) {
-    if ($Url -match '(?i)netflix') { $networkName = 'Netflix' }
-    elseif ($Url -match '(?i)hbo') { $networkName = 'HBO' }
-    else { $networkName = 'Unknown' }
+    if     ($Url -match '(?i)hbo[_\s]*max') { $networkName = 'HBO Max' }
+    elseif ($Url -match '(?i)hbo')         { $networkName = 'HBO' }
+    elseif ($Url -match '(?i)netflix')     { $networkName = 'Netflix' }
+    else                                   { $networkName = 'Unknown' }
   }
 
   # Cutoff for Upcoming
@@ -447,12 +458,13 @@ foreach ($Url in $Urls) {
       # IMDb lookup (cached by Title within this run)
       $premYear = Get-FirstYearFromText $premiere
       if (-not $imdbCache.ContainsKey($title)) {
-        $imdbCache[$title] = Get-ImdbAssessment -Title $title -PremiereYear $premYear -DelayMs $RequestDelayMs -TitleHref $titleHref
+        $imdbCache[$title] = Get-ImdbAssessment -Title $title -PremiereYear $premYear -DelayMs $RequestDelayMs -TitleHref $titleHref -NetworkHint $networkName
       }
       $assessment = $imdbCache[$title]
 
       if ($assessment.Status -eq 'ok') {
-        if ($assessment.Rating -ge $MinRating -and $assessment.Votes -ge $MinVotes) {
+        $meets = ($assessment.Rating -ge $MinRating -and $assessment.Votes -ge $MinVotes)
+        if ($meets -or $IncludeBelowThreshold.IsPresent) {
           $results.Add([pscustomobject]@{
             Title      = $title
             Genre      = $genre
@@ -486,5 +498,5 @@ if ($OutputCsv) {
   $dir = Split-Path -Parent $OutputCsv
   if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
   $sorted | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $OutputCsv
-  Write-Host "Saved $($sorted.Count) rows to $OutputCsv"
+  Write-Host ("Saved {0} rows to {1}" -f $sorted.Count, $OutputCsv)
 }
