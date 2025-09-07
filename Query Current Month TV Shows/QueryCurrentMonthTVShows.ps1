@@ -8,7 +8,7 @@
     - AND have IMDb rating >= MinRating AND votes >= MinVotes
     - OR encountered an IMDb lookup failure (included with ImdbRating = "IMDb not found" / "IMDb lookup error")
 
-  Output is sorted by Premiere ascending.
+  Adds a "Network" column (auto-detected from URL; override with -Network).
 #>
 
 [CmdletBinding()]
@@ -18,7 +18,8 @@ param(
   [int]$Year = 2025,
   [double]$MinRating = 8.4,
   [int]$MinVotes = 10000,
-  [int]$RequestDelayMs = 250
+  [int]$RequestDelayMs = 250,
+  [string]$Network    # optional override
 )
 
 function Remove-Html {
@@ -71,6 +72,22 @@ function Invoke-Http {
     'User-Agent'      = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) PowerShell scraper'
     'Accept-Language' = 'en-US,en;q=0.9'
   } -ErrorAction Stop
+}
+
+# --- Determine Network/Service from URL title ---
+function Get-NetworkFromUrlTitle {
+  param([Parameter(Mandatory)][string]$Url)
+  try {
+    $u = [uri]$Url
+    $title = $u.Segments[-1]            # e.g., List_of_Netflix_original_programming
+    $decoded = [System.Net.WebUtility]::UrlDecode($title) -replace '_',' '
+    # Match "List of <Service> original programming"
+    $m = [regex]::Match($decoded, '^(?i)List of (.+?) original programming')
+    if ($m.Success) {
+      return $m.Groups[1].Value.Trim()
+    }
+  } catch { }
+  return $null
 }
 
 # --- Wikidata helpers (NEW) ---
@@ -127,7 +144,7 @@ function Get-ImdbIdFromWikidataQid {
 # --- IMDb helpers ---
 function Try-GetImdbIdFromWikipediaPage {
   param(
-    [Parameter(Mandatory)][string]$WikiHref,  # may be relative like /wiki/Show_Title
+    [Parameter(Mandatory)][string]$WikiHref,
     [int]$DelayMs = 250
   )
   try {
@@ -147,7 +164,6 @@ function Try-GetImdbIdFromWebSearch {
     [int]$PremiereYear,
     [int]$DelayMs = 250
   )
-
   $queries = @()
   $clean = Clean-TitleForSearch $Title
   if ($PremiereYear) { $queries += "$clean ($PremiereYear) site:imdb.com/title" }
@@ -158,11 +174,7 @@ function Try-GetImdbIdFromWebSearch {
     $enc = [System.Uri]::EscapeDataString($q)
     foreach ($engine in @('bing','ddg')) {
       try {
-        $url = if ($engine -eq 'bing') {
-          "https://www.bing.com/search?q=$enc"
-        } else {
-          "https://duckduckgo.com/html/?q=$enc"
-        }
+        $url = if ($engine -eq 'bing') { "https://www.bing.com/search?q=$enc" } else { "https://duckduckgo.com/html/?q=$enc" }
         Start-Sleep -Milliseconds $DelayMs
         $resp = Invoke-Http -Uri $url
         $m = [regex]::Match($resp.Content, '/title/(tt\d+)', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
@@ -174,12 +186,7 @@ function Try-GetImdbIdFromWebSearch {
 }
 
 function Get-ImdbRating {
-  <#
-    Given a tt-id, fetch title page and parse JSON-LD for aggregateRating.
-    Returns @{ Status='ok'; Id; Rating; Votes } or @{ Status='not_found' } if rating block absent.
-  #>
   param([Parameter(Mandatory)] [string]$ImdbId)
-
   try {
     $titleUrl = "https://www.imdb.com/title/$ImdbId/"
     $resp = Invoke-Http -Uri $titleUrl
@@ -200,7 +207,6 @@ function Get-ImdbRating {
       } catch { continue }
     }
     if (-not $best) { return @{ Status='not_found' } }
-
     $val = [double]$best.aggregateRating.ratingValue
     $cntRaw = $best.aggregateRating.ratingCount
     if ($cntRaw -isnot [int]) { $cntRaw = ($cntRaw.ToString() -replace ',', '') }
@@ -232,7 +238,6 @@ function Get-ImdbAssessment {
   )
 
   try {
-    # 1) IMDb suggestion API (original title, then cleaned title)
     foreach ($queryTitle in @($Title, (Clean-TitleForSearch $Title))) {
       if ([string]::IsNullOrWhiteSpace($queryTitle)) { continue }
       try {
@@ -258,7 +263,6 @@ function Get-ImdbAssessment {
       } catch { }
     }
 
-    # 2) IMDb "find" HTML search
     try {
       $findUrl = "https://www.imdb.com/find/?s=tt&q=" + [System.Uri]::EscapeDataString($Title)
       $findResp = Invoke-Http -Uri $findUrl
@@ -270,28 +274,22 @@ function Get-ImdbAssessment {
       }
     } catch { }
 
-    # 3) Wikidata P345 (preferred if available)
     $qid = $null
     if ($TitleHref) {
       $pageTitle = Get-WikiTitleFromHref $TitleHref
       if ($pageTitle) { $qid = Get-WikidataQidFromEnwikiTitle -EnwikiTitle $pageTitle -DelayMs $DelayMs }
     }
-    if (-not $qid) {
-      # try by plain page title (sometimes tables omit links)
-      $qid = Get-WikidataQidFromEnwikiTitle -EnwikiTitle $Title -DelayMs $DelayMs
-    }
+    if (-not $qid) { $qid = Get-WikidataQidFromEnwikiTitle -EnwikiTitle $Title -DelayMs $DelayMs }
     if ($qid) {
       $tt2 = Get-ImdbIdFromWikidataQid -Qid $qid -DelayMs $DelayMs
       if ($tt2) { Start-Sleep -Milliseconds $DelayMs; return Get-ImdbRating -ImdbId $tt2 }
     }
 
-    # 4) Wikipedia article page -> external IMDb link
     if ($TitleHref) {
       $tt3 = Try-GetImdbIdFromWikipediaPage -WikiHref $TitleHref -DelayMs $DelayMs
       if ($tt3) { Start-Sleep -Milliseconds $DelayMs; return Get-ImdbRating -ImdbId $tt3 }
     }
 
-    # 5) Web search (Bing -> DuckDuckGo) for a tt-id
     $tt4 = Try-GetImdbIdFromWebSearch -Title $Title -PremiereYear $PremiereYear -DelayMs $DelayMs
     if ($tt4) { Start-Sleep -Milliseconds $DelayMs; return Get-ImdbRating -ImdbId $tt4 }
 
@@ -302,54 +300,6 @@ function Get-ImdbAssessment {
   }
 }
 
-# --- Helper to parse Premiere into a sortable DateTime key ---
-function Get-PremiereSortKey {
-  param([string]$Premiere)
-
-  # Put unparseable at the end
-  $fallback = [DateTime]::MaxValue
-
-  if ([string]::IsNullOrWhiteSpace($Premiere)) { return $fallback }
-
-  # Use first segment if multiple dates (we turned <br> into '; ')
-  $s = ($Premiere -split ';')[0].Trim()
-
-  # If there is a range with en/em dash (e.g., "Jan 5–7, 2025"), keep the first part
-  $s = ($s -split '[–—]')[0].Trim()
-
-  # Try common explicit patterns first
-  $culture = [System.Globalization.CultureInfo]::GetCultureInfo('en-US')
-  $styles  = [System.Globalization.DateTimeStyles]::AssumeLocal
-
-  # ISO yyyy-MM-dd
-  $m = [regex]::Match($s, '\b\d{4}-\d{2}-\d{2}\b')
-  if ($m.Success) {
-    $dt = [datetime]::MinValue
-    if ([datetime]::TryParseExact($m.Value, 'yyyy-MM-dd', $culture, $styles, [ref]$dt)) { return $dt }
-  }
-
-  # US M/d/yyyy
-  $m = [regex]::Match($s, '\b\d{1,2}/\d{1,2}/\d{4}\b')
-  if ($m.Success) {
-    $dt = [datetime]::MinValue
-    if ([datetime]::TryParse($m.Value, $culture, $styles, [ref]$dt)) { return $dt }
-  }
-
-  # Month d, yyyy  OR  d Month yyyy  OR general natural-language date
-  $dt2 = [datetime]::MinValue
-  if ([datetime]::TryParse($s, $culture, $styles, [ref]$dt2)) { return $dt2 }
-
-  # Month yyyy (no day) -> assume day 1
-  $m = [regex]::Match($s, '^(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})$', 'IgnoreCase')
-  if ($m.Success) {
-    $first = ('{0} 1, {1}' -f $m.Groups[1].Value, $m.Groups[2].Value)
-    $dt3 = [datetime]::MinValue
-    if ([datetime]::TryParse($first, $culture, $styles, [ref]$dt3)) { return $dt3 }
-  }
-
-  return $fallback
-}
-
 # --- Download the Wikipedia HTML ---
 try {
   try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
@@ -358,6 +308,14 @@ try {
 }
 catch {
   throw "Failed to download $Url. $_"
+}
+
+# Determine network/service name
+$networkName = if ($Network) {
+  $Network
+} else {
+  $auto = Get-NetworkFromUrlTitle -Url $Url
+  if ($auto) { $auto } else { 'Netflix' }
 }
 
 # --- Regexes for Wikipedia tables and headers ---
@@ -469,32 +427,30 @@ foreach ($t in $tableRe.Matches($html)) {
           Title      = $title
           Genre      = $genre
           Premiere   = $premiere
+          Network    = $networkName
           ImdbRating = [math]::Round($assessment.Rating, 1)
         }) | Out-Null
       }
     }
     elseif ($assessment.Status -in @('not_found','error')) {
-      # Include not-found/error rows with an explanatory ImdbRating value
       $label = if ($assessment.Status -eq 'not_found') { 'IMDb not found' } else { 'IMDb lookup error' }
       $results.Add([pscustomobject]@{
         Title      = $title
         Genre      = $genre
         Premiere   = $premiere
+        Network    = $networkName
         ImdbRating = $label
       }) | Out-Null
     }
   }
 }
 
-# --- Sort by Premiere ascending ---
-$sorted = $results | Sort-Object @{ Expression = { Get-PremiereSortKey $_.Premiere } }, @{ Expression = 'Title' }
-
 # Emit results and optionally save
-$sorted
+$results
 
 if ($OutputCsv) {
   $dir = Split-Path -Parent $OutputCsv
   if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
-  $sorted | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $OutputCsv
-  Write-Host "Saved $($sorted.Count) rows to $OutputCsv"
+  $results | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $OutputCsv
+  Write-Host "Saved $($results.Count) rows to $OutputCsv"
 }
