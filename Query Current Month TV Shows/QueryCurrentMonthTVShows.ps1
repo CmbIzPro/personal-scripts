@@ -12,10 +12,8 @@
   - IMDb: by default keeps only shows with Rating >= MinRating and Votes >= MinVotes
           OR includes rows with lookup failures ("IMDb not found" / "IMDb lookup error")
   - Adds Network column (auto from URL)
-  - Sorts the run’s results by IMDb rating DESC (numeric first; not-found/errors at bottom)
-  - DEFAULT: When -OutputCsv exists, **append-only deltas** are written (no reordering of existing rows).
-    The script avoids adding duplicates by using an identity key (Title|Network|PremiereDate).
-    Duplicates within the current run are removed before appending.
+  - DEFAULT WRITE BEHAVIOR: merges existing CSV + new rows, de-dups by identity key,
+    then sorts the ENTIRE file by IMDb rating DESC on write (numeric first; not-found/errors last).
 
 .OUTPUT
   Objects with Title, Genre, Premiere, Network, ImdbRating
@@ -390,7 +388,7 @@ function Resolve-MonthNumber {
     if ($n -ge 1 -and $n -le 12) { return $n } else { return $null }
   }
 
-  # Names: "July", "Jul" (case-insensitive), using stable ParseExact
+  # Names: "July", "Jul" (case-insensitive)
   $culture = [System.Globalization.CultureInfo]::GetCultureInfo('en-US')
   $title   = $culture.TextInfo.ToTitleCase($m.ToLowerInvariant())
 
@@ -404,7 +402,7 @@ function Resolve-MonthNumber {
   return $null
 }
 
-# --- Dedup helpers (for current run & appending) ---
+# --- Dedup & shape helpers ---
 function Select-OutputShape {
   param([Parameter(Mandatory)][object[]]$Rows)
   $Rows | Select-Object Title, Genre, Premiere, Network, ImdbRating
@@ -412,6 +410,7 @@ function Select-OutputShape {
 
 function Get-IdentityKey {
   param([Parameter(Mandatory)][psobject]$Row)
+  if (-not $Row) { return $null }
   $t = if ($Row.Title)   { $Row.Title.Trim().ToLowerInvariant() }   else { '' }
   $n = if ($Row.Network) { $Row.Network.Trim().ToLowerInvariant() } else { '' }
   $pKey = ''
@@ -428,13 +427,25 @@ function Dedup-ByKey {
   $seen = New-Object 'System.Collections.Generic.HashSet[string]'
   $out = New-Object System.Collections.Generic.List[object]
   foreach ($r in $Rows) {
+    if (-not $r) { continue }
     $k = Get-IdentityKey -Row $r
+    if (-not $k) { continue }
     if (-not $seen.Contains($k)) {
       [void]$seen.Add($k)
       $out.Add($r)
     }
   }
-  return $out
+  return $out.ToArray()
+}
+
+function Sort-ByImdbRatingDesc {
+  param([Parameter(Mandatory)][object[]]$Rows)
+  $Rows | Sort-Object -Property @{
+    Expression = {
+      $n = 0.0
+      if ([double]::TryParse($_.ImdbRating, [ref]$n)) { $n } else { -1 }
+    }
+  } -Descending
 }
 
 # --- Main scrape across one or more URLs ---
@@ -450,7 +461,7 @@ $monthPattern   = '(?i)\b(January|Jan|February|Feb|March|Mar|April|Apr|May|June|
 $isoDatePattern = '\b\d{4}-\d{2}-\d{2}\b'
 $usDatePattern  = '\b\d{1,2}/\d{1,2}/\d{4}\b'
 
-# Compute optional month window based on parameter set (Option B included)
+# Compute optional month window
 $windowStart = $null
 $windowEndExclusive = $null
 $useMonthWindow = $false
@@ -469,9 +480,7 @@ switch ($PSCmdlet.ParameterSetName) {
     $windowEndExclusive = $windowStart.AddMonths(1)
     $useMonthWindow = $true
   }
-  default {
-    # No month window; default Year + month/day rules apply
-  }
+  default { }
 }
 
 $imdbCache = @{}
@@ -616,65 +625,57 @@ foreach ($Url in $Urls) {
   }
 }
 
-# Sort this run’s results by IMDb rating descending (numeric first; not-found/errors at bottom)
-$sorted = @($results | Sort-Object -Property @{
-  Expression = {
-    $num = 0.0
-    if ([double]::TryParse($_.ImdbRating, [ref]$num)) { $num } else { -1 }
-  }
-} -Descending)
-
-# Shape and de-dup the current run
-$shapeNew = Select-OutputShape -Rows $sorted
-$dedupNew = Dedup-ByKey -Rows $shapeNew
+# Shape and de-dup the current run (no pre-sort; sort happens at CSV write)
+$runRows  = if ($results) { $results.ToArray() } else { @() }
+$shapeNew = if ($runRows.Count -gt 0) { Select-OutputShape -Rows $runRows } else { @() }
+$dedupNew = if ($shapeNew.Count -gt 0) { Dedup-ByKey -Rows $shapeNew } else { @() }
 
 # Emit current run to console
 $dedupNew
 
-# --- Append-only deltas (DEFAULT BEHAVIOR) ---
+# --- Write to CSV (DEFAULT: merge + dedup + SORT ENTIRE FILE on write) ---
 if ($OutputCsv) {
   $dir = Split-Path -Parent $OutputCsv
   if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
 
-  $toAppend = @($dedupNew)
+  # New rows from this run (already shaped & de-duped earlier)
+  $newRows = @($dedupNew)
 
+  # Existing rows (if any)
+  $existing = @()
   if (Test-Path $OutputCsv) {
-    try {
-      $existing = @((Import-Csv $OutputCsv))
-      $shapeExisting = Select-OutputShape -Rows $existing
+    try   { $existing = @((Import-Csv $OutputCsv)) }
+    catch { Write-Warning ("Failed to read existing CSV '{0}': {1}" -f $OutputCsv, $_.Exception.Message) }
+  }
+  $shapeExisting = if ($existing.Count -gt 0) { Select-OutputShape -Rows $existing } else { @() }
 
-      # Build a set of existing identity keys
-      $existingKeys = New-Object 'System.Collections.Generic.HashSet[string]'
-      foreach ($er in $shapeExisting) {
-        $k = Get-IdentityKey -Row $er
-        if ($k) { [void]$existingKeys.Add($k) }
-      }
+  # Build map (identity key → row). New rows override existing rows with the same key.
+  $map = @{}
+  foreach ($r in $shapeExisting) {
+    if (-not $r) { continue }
+    $k = Get-IdentityKey -Row $r
+    if ($k) { $map[$k] = $r }
+  }
+  foreach ($r in $newRows) {
+    if (-not $r) { continue }
+    $k = Get-IdentityKey -Row $r
+    if ($k) { $map[$k] = $r }
+  }
 
-      # Keep only rows whose key is NOT already present
-      $toAppend = @(
-        foreach ($r in $dedupNew) {
-          $k = Get-IdentityKey -Row $r
-          if (-not $existingKeys.Contains($k)) { $r }
-        }
-      )
+  # Sort ENTIRE merged set by IMDb rating DESC (numeric first), then save
+  $merged    = @($map.Values)
+  $sortedAll = if ($merged.Count -gt 0) { Sort-ByImdbRatingDesc -Rows $merged } else { @() }
 
-      $skipped = $dedupNew.Count - $toAppend.Count
-      Write-Host ("Existing file found. Appending {0} new row(s); skipped {1} duplicate(s)." -f $toAppend.Count, $skipped)
-    } catch {
-      Write-Warning ("Failed to read existing CSV '{0}': {1}" -f $OutputCsv, $_.Exception.Message)
-    }
+  if ($sortedAll.Count -gt 0) {
+    $sortedAll | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $OutputCsv
   } else {
-    Write-Host ("No existing CSV. Writing {0} row(s)." -f $toAppend.Count)
+    # If nothing to write but file exists, leave it untouched; else create an empty CSV with headers.
+    if (-not (Test-Path $OutputCsv)) {
+      # write just headers
+      "" | Select-Object @{n='Title';e={}}, @{n='Genre';e={}}, @{n='Premiere';e={}}, @{n='Network';e={}}, @{n='ImdbRating';e={}} |
+        Export-Csv -NoTypeInformation -Encoding UTF8 -Path $OutputCsv
+    }
   }
 
-  if ($toAppend.Count -gt 0) {
-    # Ensure appended rows themselves are ordered (rating desc), but do NOT reorder existing file
-    @($toAppend | Sort-Object -Property @{
-      Expression = {
-        $num = 0.0
-        if ([double]::TryParse($_.ImdbRating, [ref]$num)) { $num } else { -1 }
-      }
-    } -Descending) |
-      Export-Csv -NoTypeInformation -Encoding UTF8 -Path $OutputCsv -Append
-  }
+  Write-Host ("Merged {0} existing + {1} new → wrote {2} total row(s); fully resorted by rating DESC." -f $shapeExisting.Count, $newRows.Count, $sortedAll.Count)
 }
