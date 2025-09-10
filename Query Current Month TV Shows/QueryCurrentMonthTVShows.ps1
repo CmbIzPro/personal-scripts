@@ -13,10 +13,14 @@
           OR includes rows with lookup failures ("IMDb not found" / "IMDb lookup error")
   - Adds Network column (auto from URL)
   - DEFAULT WRITE BEHAVIOR: merges existing CSV + new rows, de-dups by identity key,
-    then sorts the ENTIRE file by IMDb rating DESC on write (numeric first; not-found/errors last).
+    then sorts the ENTIRE file by:
+      1) IMDb rating (numeric) DESC
+      2) IMDb votes (numeric) DESC
+      3) Premiere date ASC
+      4) Title ASC
 
 .OUTPUT
-  Objects with Title, Genre, Premiere, Network, ImdbRating
+  Objects with Title, Genre, Premiere, Network, ImdbRating, ImdbVotes, ImdbId
 #>
 
 [CmdletBinding(DefaultParameterSetName='Default')]
@@ -221,9 +225,7 @@ function Try-GetImdbIdFromWebSearch {
     $hints.Add($NetworkHint)
     if ($NetworkHint -match '(?i)Apple\s*TV\+') { $hints.Add(($NetworkHint -replace '\+',' Plus')) }
     if ($NetworkHint -match '(?i)\bHBO Max\b') { $hints.Add('Max') }
-    foreach ($h in $hints) {
-      $queries += "$clean `"$h`" site:imdb.com/title"
-    }
+    foreach ($h in $hints) { $queries += "$clean `"$h`" site:imdb.com/title" }
   }
 
   $queries += "$clean site:imdb.com/title"
@@ -405,7 +407,7 @@ function Resolve-MonthNumber {
 # --- Dedup & shape helpers ---
 function Select-OutputShape {
   param([Parameter(Mandatory)][object[]]$Rows)
-  $Rows | Select-Object Title, Genre, Premiere, Network, ImdbRating
+  $Rows | Select-Object Title, Genre, Premiere, Network, ImdbRating, ImdbVotes, ImdbId
 }
 
 function Get-IdentityKey {
@@ -438,14 +440,20 @@ function Dedup-ByKey {
   return $out.ToArray()
 }
 
-function Sort-ByImdbRatingDesc {
+function Sort-ByOutputOrder {
+  <#
+    Sort ENTIRE merged set by:
+      1) IMDb rating numeric DESC (others → -1)
+      2) IMDb votes  numeric DESC (others → -1)
+      3) Premiere date ASC (unknown → MaxValue)
+      4) Title ASC
+  #>
   param([Parameter(Mandatory)][object[]]$Rows)
-  $Rows | Sort-Object -Property @{
-    Expression = {
-      $n = 0.0
-      if ([double]::TryParse($_.ImdbRating, [ref]$n)) { $n } else { -1 }
-    }
-  } -Descending
+  $Rows | Sort-Object `
+    @{ e = { $r = $_.ImdbRating; $n = [double]::NaN; if([double]::TryParse($r, [ref]$n)){ $n } else { -1 } }; Descending = $true }, `
+    @{ e = { $v = $_.ImdbVotes;  $n = [int]::MinValue; if([int]::TryParse($v, [ref]$n)){ $n } else { -1 } }; Descending = $true }, `
+    @{ e = { $d = Get-PremiereDate $_.Premiere; if($d){$d}else{[datetime]::MaxValue} } }, `
+    'Title'
 }
 
 # --- Main scrape across one or more URLs ---
@@ -608,6 +616,8 @@ foreach ($Url in $Urls) {
             Premiere   = $premiere
             Network    = $networkName
             ImdbRating = [math]::Round($assessment.Rating, 1)
+            ImdbVotes  = $assessment.Votes
+            ImdbId     = $assessment.Id
           }) | Out-Null
         }
       }
@@ -619,6 +629,8 @@ foreach ($Url in $Urls) {
           Premiere   = $premiere
           Network    = $networkName
           ImdbRating = $label
+          ImdbVotes  = $null
+          ImdbId     = $null
         }) | Out-Null
       }
     }
@@ -633,7 +645,7 @@ $dedupNew = if ($shapeNew.Count -gt 0) { Dedup-ByKey -Rows $shapeNew } else { @(
 # Emit current run to console
 $dedupNew
 
-# --- Write to CSV (DEFAULT: merge + dedup + SORT ENTIRE FILE on write) ---
+# --- Write to CSV (merge + dedup + STRONG SORT on write) ---
 if ($OutputCsv) {
   $dir = Split-Path -Parent $OutputCsv
   if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
@@ -662,20 +674,18 @@ if ($OutputCsv) {
     if ($k) { $map[$k] = $r }
   }
 
-  # Sort ENTIRE merged set by IMDb rating DESC (numeric first), then save
+  # Sort ENTIRE merged set by Rating DESC → Votes DESC → Premiere ASC → Title ASC
   $merged    = @($map.Values)
-  $sortedAll = if ($merged.Count -gt 0) { Sort-ByImdbRatingDesc -Rows $merged } else { @() }
+  $sortedAll = if ($merged.Count -gt 0) { Sort-ByOutputOrder -Rows $merged } else { @() }
 
   if ($sortedAll.Count -gt 0) {
     $sortedAll | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $OutputCsv
   } else {
-    # If nothing to write but file exists, leave it untouched; else create an empty CSV with headers.
     if (-not (Test-Path $OutputCsv)) {
-      # write just headers
-      "" | Select-Object @{n='Title';e={}}, @{n='Genre';e={}}, @{n='Premiere';e={}}, @{n='Network';e={}}, @{n='ImdbRating';e={}} |
+      "" | Select-Object @{n='Title';e={}}, @{n='Genre';e={}}, @{n='Premiere';e={}}, @{n='Network';e={}}, @{n='ImdbRating';e={}}, @{n='ImdbVotes';e={}}, @{n='ImdbId';e={}} |
         Export-Csv -NoTypeInformation -Encoding UTF8 -Path $OutputCsv
     }
   }
 
-  Write-Host ("Merged {0} existing + {1} new → wrote {2} total row(s); fully resorted by rating DESC." -f $shapeExisting.Count, $newRows.Count, $sortedAll.Count)
+  Write-Host ("Merged {0} existing + {1} new → wrote {2} total row(s); fully resorted by rating DESC, votes DESC, premiere ASC, title ASC." -f $shapeExisting.Count, $newRows.Count, $sortedAll.Count)
 }
