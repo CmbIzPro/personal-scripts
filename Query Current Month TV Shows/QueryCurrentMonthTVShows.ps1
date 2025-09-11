@@ -22,6 +22,7 @@
     and can optionally emit a JSON changelog via -DeltaJsonPath.
   - Persistent IMDb cache (DEFAULT ON): disk-backed JSON cache for IMDb lookups to reduce re-requests.
     Disable with -NoPersistentCache. Control staleness with -CacheMaxAgeDays. Change file via -ImdbCachePath.
+  - Parallel IMDb lookups (DEFAULT ON in PowerShell 7+): uses ForEach-Object -Parallel with -ThrottleLimit.
 
 .OUTPUT
   Objects with Title, Genre, Premiere, Network, ImdbRating, ImdbVotes, ImdbId
@@ -68,20 +69,24 @@ param(
   # Persistent cache controls (DEFAULT ON)
   [switch]$NoPersistentCache,
   [string]$ImdbCachePath,
-  [int]$CacheMaxAgeDays = 21
+  [int]$CacheMaxAgeDays = 21,
+
+  # Parallel controls (DEFAULT ON for PS 7+)
+  [int]$ParallelThrottle = 6,
+  [switch]$DisableParallel
 )
 
 function Remove-Html {
   param([string]$Html)
   if ([string]::IsNullOrWhiteSpace($Html)) { return $null }
   $s = $Html
-  $s = $s -replace '<sup[^>]*>.*?</sup>', ''                 # citation superscripts
-  $s = $s -replace '<span[^>]*class="nowrap"[^>]*>', ''       # unwrap nowrap spans
-  $s = $s -replace '<br\s*/?>', '; '                          # <br> => separator
-  $s = $s -replace '<[^>]+>', ''                              # strip tags
-  $s = [System.Net.WebUtility]::HtmlDecode($s)                # decode entities
-  $s = $s -replace '\[\d+\]', ''                              # [1]
-  $s = $s -replace '\s{2,}', ' '                              # collapse whitespace
+  $s = $s -replace '<sup[^>]*>.*?</sup>', ''
+  $s = $s -replace '<span[^>]*class="nowrap"[^>]*>', ''
+  $s = $s -replace '<br\s*/?>', '; '
+  $s = $s -replace '<[^>]+>', ''
+  $s = [System.Net.WebUtility]::HtmlDecode($s)
+  $s = $s -replace '\[\d+\]', ''
+  $s = $s -replace '\s{2,}', ' '
   $s.Trim()
 }
 
@@ -102,8 +107,8 @@ function Clean-TitleForSearch {
   if (-not $Title) { return $Title }
   $t = [System.Net.WebUtility]::HtmlDecode($Title)
   $t = Remove-Diacritics $t
-  $t = $t -replace '\s*\([^)]*\)\s*', ''     # drop parentheticals
-  $t = $t -replace '[:–—\-&]+', ' '          # normalize punctuation and &
+  $t = $t -replace '\s*\([^)]*\)\s*', ''
+  $t = $t -replace '[:–—\-&]+', ' '
   $t = $t -replace '\s{2,}', ' '
   $t.Trim()
 }
@@ -128,7 +133,7 @@ function Get-NetworkFromUrlTitle {
   param([Parameter(Mandatory)][string]$Url)
   try {
     $u = [uri]$Url
-    $title = $u.Segments[$u.Segments.Count-1]  # trailing segment
+    $title = $u.Segments[$u.Segments.Count-1]
     $decoded = [System.Net.WebUtility]::UrlDecode($title) -replace '_',' '
     $m = [regex]::Match($decoded, '^(?i)List of (.+?) original programming')
     if ($m.Success) { return $m.Groups[1].Value.Trim() }
@@ -390,13 +395,11 @@ function Resolve-MonthNumber {
   param([Parameter(Mandatory)][string]$Month)
   $m = $Month.Trim()
 
-  # Numeric: "7" or "07"
   $n = 0
   if ([int]::TryParse($m, [ref]$n)) {
     if ($n -ge 1 -and $n -le 12) { return $n } else { return $null }
   }
 
-  # Names: "July", "Jul" (case-insensitive)
   $culture = [System.Globalization.CultureInfo]::GetCultureInfo('en-US')
   $title   = $culture.TextInfo.ToTitleCase($m.ToLowerInvariant())
 
@@ -537,7 +540,6 @@ function Is-CacheEntryFresh {
 
 function To-AssessmentFromCache {
   param([Parameter(Mandatory)][psobject]$Entry)
-  # Return same shape used elsewhere
   $ht = @{
     Status = $Entry.Status
     Id     = $Entry.Id
@@ -626,7 +628,8 @@ function Get-DeltaReport {
   [pscustomobject]@{ Added=$added.ToArray(); Updated=$updated.ToArray(); Removed=$removed.ToArray() }
 }
 
-# --- Main scrape across one or more URLs ---
+# --- MAIN ---
+
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
 
 $tableRe = [regex]::new('<table[^>]*class="[^"]*wikitable[^"]*"[^>]*>.*?<\/table>', 'IgnoreCase,Singleline')
@@ -669,7 +672,9 @@ $cacheDirty = $false
 if ($usePersistentCache) { $persistCache = Load-PersistentCache -Path $effectiveCachePath }
 
 $imdbCache = @{}   # in-memory for this run (filled from persistent or fresh lookups)
-$results = New-Object System.Collections.Generic.List[object]
+
+# We'll first collect "work items" (rows that pass date filters) WITHOUT doing IMDb lookups inline.
+$workItems = New-Object System.Collections.Generic.List[psobject]
 
 foreach ($Url in $Urls) {
   try {
@@ -766,59 +771,274 @@ foreach ($Url in $Urls) {
         if (-not ($hasYear -and $hasMonthOrDate)) { continue }
       }
 
-      # --- IMDb lookup with persistent cache ---
       $premYear = if ($premDate) { $premDate.Year } else { Get-FirstYearFromText $premiere }
-      $imdbKey  = "{0}|{1}" -f $networkName, $title
 
-      if (-not $imdbCache.ContainsKey($imdbKey)) {
-        $usedCache = $false
-        if ($usePersistentCache -and $persistCache.ContainsKey($imdbKey)) {
-          $entry = $persistCache[$imdbKey]
-          if (Is-CacheEntryFresh -Entry $entry -MaxAgeDays $CacheMaxAgeDays) {
-            $imdbCache[$imdbKey] = To-AssessmentFromCache -Entry $entry
-            $usedCache = $true
+      $workItems.Add([pscustomobject]@{
+        Title        = $title
+        Genre        = $genre
+        Premiere     = $premiere
+        Network      = $networkName
+        PremiereYear = $premYear
+        TitleHref    = $titleHref
+      }) | Out-Null
+    }
+  }
+}
+
+# Build pending IMDb lookups (respecting persistent cache)
+$pending = New-Object System.Collections.Generic.List[psobject]
+$seenKeys = New-Object 'System.Collections.Generic.HashSet[string]'
+foreach ($wi in $workItems) {
+  $key = '{0}|{1}' -f $wi.Network, $wi.Title
+  if ($seenKeys.Contains($key)) { continue }
+  [void]$seenKeys.Add($key)
+
+  $usedCache = $false
+  if ($usePersistentCache -and $persistCache.ContainsKey($key)) {
+    $entry = $persistCache[$key]
+    if (Is-CacheEntryFresh -Entry $entry -MaxAgeDays $CacheMaxAgeDays) {
+      $imdbCache[$key] = To-AssessmentFromCache -Entry $entry
+      $usedCache = $true
+    }
+  }
+  if (-not $usedCache) {
+    $pending.Add([pscustomobject]@{
+      Key          = $key
+      Title        = $wi.Title
+      PremiereYear = $wi.PremiereYear
+      TitleHref    = $wi.TitleHref
+      Network      = $wi.Network
+    }) | Out-Null
+  }
+}
+
+# Resolve pending IMDb lookups (PARALLEL in PS 7+ unless disabled)
+$canParallel = ($PSVersionTable.PSVersion.Major -ge 7) -and (-not $DisableParallel.IsPresent)
+if ($pending.Count -gt 0) {
+  if ($canParallel) {
+    Write-Host ("[IMDb] Resolving {0} lookups in parallel (ThrottleLimit={1})..." -f $pending.Count, $ParallelThrottle)
+    $parOut = $pending | ForEach-Object -Parallel {
+      param($it)
+
+      function Local-RemoveDiacritics {
+        param([string]$Text)
+        if (-not $Text) { return $Text }
+        $norm = $Text.Normalize([Text.NormalizationForm]::FormD)
+        $sb = New-Object System.Text.StringBuilder
+        foreach ($ch in $norm.ToCharArray()) {
+          if (-not [Globalization.CharUnicodeInfo]::GetUnicodeCategory($ch) -eq [Globalization.UnicodeCategory]::NonSpacingMark) {
+            [void]$sb.Append($ch)
           }
         }
+        $sb.ToString().Normalize([Text.NormalizationForm]::FormC)
+      }
 
-        if (-not $usedCache) {
-          $assess = Get-ImdbAssessment -Title $title -PremiereYear $premYear -DelayMs $RequestDelayMs -TitleHref $titleHref -NetworkHint $networkName
-          $imdbCache[$imdbKey] = $assess
-          if ($usePersistentCache) {
-            Update-PersistentCacheEntry -Cache $persistCache -Key $imdbKey -Assessment $assess
-            $cacheDirty = $true
+      function Local-CleanTitleForSearch {
+        param([string]$Title)
+        if (-not $Title) { return $Title }
+        $t = [System.Net.WebUtility]::HtmlDecode($Title)
+        $t = Local-RemoveDiacritics $t
+        $t = $t -replace '\s*\([^)]*\)\s*', ''
+        $t = $t -replace '[:–—\-&]+', ' '
+        $t = $t -replace '\s{2,}', ' '
+        $t.Trim()
+      }
+
+      function Local-InvokeHttp {
+        param([string]$Uri)
+        Invoke-WebRequest -Uri $Uri -Headers @{
+          'User-Agent'      = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) PowerShell scraper'
+          'Accept-Language' = 'en-US,en;q=0.9'
+        } -ErrorAction Stop
+      }
+
+      function Local-GetImdbRating {
+        param([string]$ImdbId)
+        try {
+          $titleUrl = "https://www.imdb.com/title/$ImdbId/"
+          $resp = Local-InvokeHttp -Uri $titleUrl
+          $ldRe = [regex]::new('<script[^>]+type=["'']application/ld\+json["''][^>]*>(.*?)</script>', 'IgnoreCase,Singleline')
+          $best = $null
+          foreach ($m in $ldRe.Matches($resp.Content)) {
+            $jsonText = $m.Groups[1].Value
+            try {
+              $j = $jsonText | ConvertFrom-Json
+              $objs = @()
+              if ($j -is [System.Collections.IEnumerable] -and -not ($j -is [string])) { $objs = $j } else { $objs = @($j) }
+              foreach ($o in $objs) {
+                if ($o.aggregateRating -and $o.aggregateRating.ratingValue -and $o.aggregateRating.ratingCount) { $best = $o; break }
+              }
+              if ($best) { break }
+            } catch { continue }
           }
+          if (-not $best) { return @{ Status='not_found' } }
+          $val = [double]$best.aggregateRating.ratingValue
+          $cntRaw = $best.aggregateRating.ratingCount
+          if ($cntRaw -isnot [int]) { $cntRaw = ($cntRaw.ToString() -replace ',', '') }
+          $cnt = [int]$cntRaw
+          return @{ Status='ok'; Id=$ImdbId; Rating=$val; Votes=$cnt }
+        } catch {
+          return @{ Status='error' }
         }
       }
 
-      $assessment = $imdbCache[$imdbKey]
-
-      if ($assessment.Status -eq 'ok') {
-        $meets = ($assessment.Rating -ge $MinRating -and $assessment.Votes -ge $MinVotes)
-        if ($meets -or $IncludeBelowThreshold.IsPresent) {
-          $results.Add([pscustomobject]@{
-            Title      = $title
-            Genre      = $genre
-            Premiere   = $premiere
-            Network    = $networkName
-            ImdbRating = [math]::Round($assessment.Rating, 1)
-            ImdbVotes  = $assessment.Votes
-            ImdbId     = $assessment.Id
-          }) | Out-Null
-        }
+      function Local-TryGetImdbFromWikipediaPage {
+        param([string]$WikiHref, [int]$DelayMs)
+        try {
+          if (-not $WikiHref) { return $null }
+          $uri = $WikiHref
+          if ($uri -notmatch '^https?://') { $uri = 'https://en.wikipedia.org' + $WikiHref }
+          Start-Sleep -Milliseconds $DelayMs
+          $resp = Local-InvokeHttp -Uri $uri
+          $m = [regex]::Match($resp.Content, '/title/(tt\d+)', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+          if ($m.Success) { return $m.Groups[1].Value }
+        } catch {}
+        return $null
       }
-      elseif ($assessment.Status -in @('not_found','error')) {
-        $label = if ($assessment.Status -eq 'not_found') { 'IMDb not found' } else { 'IMDb lookup error' }
-        $results.Add([pscustomobject]@{
-          Title      = $title
-          Genre      = $genre
-          Premiere   = $premiere
-          Network    = $networkName
-          ImdbRating = $label
-          ImdbVotes  = $null
-          ImdbId     = $null
-        }) | Out-Null
+
+      function Local-TryGetImdbByWebSearch {
+        param([string]$Title,[int]$PremiereYear,[string]$NetworkHint,[int]$DelayMs)
+        $queries = @()
+        $clean = Local-CleanTitleForSearch $Title
+        if ($PremiereYear) { $queries += "$clean ($PremiereYear) site:imdb.com/title" }
+        if ($NetworkHint) {
+          $hints = @($NetworkHint)
+          if ($NetworkHint -match '(?i)Apple\s*TV\+') { $hints += ($NetworkHint -replace '\+',' Plus') }
+          if ($NetworkHint -match '(?i)\bHBO Max\b') { $hints += 'Max' }
+          foreach ($h in $hints) { $queries += "$clean `"$h`" site:imdb.com/title" }
+        }
+        $queries += "$clean site:imdb.com/title"
+        foreach ($q in $queries) {
+          $enc = [System.Uri]::EscapeDataString($q)
+          foreach ($engine in @('bing','ddg')) {
+            try {
+              $url = if ($engine -eq 'bing') { "https://www.bing.com/search?q=$enc" } else { "https://duckduckgo.com/html/?q=$enc" }
+              Start-Sleep -Milliseconds $DelayMs
+              $resp = Local-InvokeHttp -Uri $url
+              $m = [regex]::Match($resp.Content, '/title/(tt\d+)', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+              if ($m.Success) { return $m.Groups[1].Value }
+            } catch { continue }
+          }
+        }
+        return $null
+      }
+
+      # --- Do the assessment (subset of full pipeline; fast + robust) ---
+      $Title        = $it.Title
+      $PremiereYear = $it.PremiereYear
+      $TitleHref    = $it.TitleHref
+      $NetworkHint  = $it.Network
+      $DelayMs      = $using:RequestDelayMs
+
+      $assessment = $null
+      try {
+        foreach ($queryTitle in @($Title, (Local-CleanTitleForSearch $Title))) {
+          if ([string]::IsNullOrWhiteSpace($queryTitle)) { continue }
+          try {
+            $firstLetter = ($queryTitle.Trim())[0].ToString().ToLower()
+            $sugUrl = "https://v2.sg.media-imdb.com/suggestion/$firstLetter/" + [System.Uri]::EscapeDataString($queryTitle) + ".json"
+            $sugResp = Local-InvokeHttp -Uri $sugUrl
+            $json = $sugResp.Content | ConvertFrom-Json
+            if ($json -and $json.d) {
+              $scored = foreach ($d in $json.d) {
+                if (-not ($d.id -match '^tt\d+')) { continue }
+                $score = 0
+                if ($d.l -eq $queryTitle) { $score += 2 }
+                if ($PremiereYear -and $d.y -eq $PremiereYear) { $score += 3 }
+                elseif ($PremiereYear -and $d.yr -and ($d.yr -match [regex]::Escape("$PremiereYear"))) { $score += 2 }
+                if ($d.q -match '(?i)TV') { $score += 1 }
+                [pscustomobject]@{ Id=$d.id; Score=$score }
+              }
+              if ($scored) {
+                $ttId = ($scored | Sort-Object Score -Descending | Select-Object -First 1).Id
+                if ($ttId) { Start-Sleep -Milliseconds $DelayMs; $assessment = Local-GetImdbRating -ImdbId $ttId; break }
+              }
+            }
+          } catch { }
+        }
+        if (-not $assessment) {
+          try {
+            $findUrl = "https://www.imdb.com/find/?s=tt&q=" + [System.Uri]::EscapeDataString($Title)
+            $findResp = Local-InvokeHttp -Uri $findUrl
+            $m = [regex]::Match($findResp.Content, '/title/(tt\d+)/')
+            if ($m.Success) {
+              $ttId = $m.Groups[1].Value
+              Start-Sleep -Milliseconds $DelayMs
+              $assessment = Local-GetImdbRating -ImdbId $ttId
+            }
+          } catch { }
+        }
+        if (-not $assessment -and $TitleHref) {
+          $tt3 = Local-TryGetImdbFromWikipediaPage -WikiHref $TitleHref -DelayMs $DelayMs
+          if ($tt3) { Start-Sleep -Milliseconds $DelayMs; $assessment = Local-GetImdbRating -ImdbId $tt3 }
+        }
+        if (-not $assessment) {
+          $tt4 = Local-TryGetImdbByWebSearch -Title $Title -PremiereYear $PremiereYear -NetworkHint $NetworkHint -DelayMs $DelayMs
+          if ($tt4) { Start-Sleep -Milliseconds $DelayMs; $assessment = Local-GetImdbRating -ImdbId $tt4 }
+        }
+        if (-not $assessment) { $assessment = @{ Status='not_found' } }
+      } catch {
+        $assessment = @{ Status='error' }
+      }
+
+      [pscustomobject]@{
+        Key        = $it.Key
+        Assessment = $assessment
+      }
+    } -ThrottleLimit $ParallelThrottle
+    foreach ($o in $parOut) {
+      if ($null -eq $o) { continue }
+      $imdbCache[$o.Key] = $o.Assessment
+      if ($usePersistentCache) {
+        Update-PersistentCacheEntry -Cache $persistCache -Key $o.Key -Assessment $o.Assessment
+        $cacheDirty = $true
       }
     }
+  } else {
+    Write-Host ("[IMDb] Resolving {0} lookups sequentially (PowerShell {1})..." -f $pending.Count, $PSVersionTable.PSVersion)
+    foreach ($it in $pending) {
+      $ass = Get-ImdbAssessment -Title $it.Title -PremiereYear $it.PremiereYear -DelayMs $RequestDelayMs -TitleHref $it.TitleHref -NetworkHint $it.Network
+      $imdbCache[$it.Key] = $ass
+      if ($usePersistentCache) {
+        Update-PersistentCacheEntry -Cache $persistCache -Key $it.Key -Assessment $ass
+        $cacheDirty = $true
+      }
+    }
+  }
+}
+
+# Build final results from work items + imdbCache
+$results = New-Object System.Collections.Generic.List[object]
+foreach ($wi in $workItems) {
+  $key = '{0}|{1}' -f $wi.Network, $wi.Title
+  if (-not $imdbCache.ContainsKey($key)) { continue }
+  $assessment = $imdbCache[$key]
+
+  if ($assessment.Status -eq 'ok') {
+    $meets = ($assessment.Rating -ge $MinRating -and $assessment.Votes -ge $MinVotes)
+    if ($meets -or $IncludeBelowThreshold.IsPresent) {
+      $results.Add([pscustomobject]@{
+        Title      = $wi.Title
+        Genre      = $wi.Genre
+        Premiere   = $wi.Premiere
+        Network    = $wi.Network
+        ImdbRating = [math]::Round($assessment.Rating, 1)
+        ImdbVotes  = $assessment.Votes
+        ImdbId     = $assessment.Id
+      }) | Out-Null
+    }
+  }
+  elseif ($assessment.Status -in @('not_found','error')) {
+    $label = if ($assessment.Status -eq 'not_found') { 'IMDb not found' } else { 'IMDb lookup error' }
+    $results.Add([pscustomobject]@{
+      Title      = $wi.Title
+      Genre      = $wi.Genre
+      Premiere   = $wi.Premiere
+      Network    = $wi.Network
+      ImdbRating = $label
+      ImdbVotes  = $null
+      ImdbId     = $null
+    }) | Out-Null
   }
 }
 
