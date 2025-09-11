@@ -18,6 +18,8 @@
       2) IMDb votes (numeric) DESC
       3) Premiere date ASC
       4) Title ASC
+  - Delta tracking: prints counts of Added / Updated / Removed-not-seen-this-run,
+    and can optionally emit a JSON changelog via -DeltaJsonPath.
 
 .OUTPUT
   Objects with Title, Genre, Premiere, Network, ImdbRating, ImdbVotes, ImdbId
@@ -56,7 +58,10 @@ param(
   [Parameter(ParameterSetName='ExplicitMonth', Mandatory=$true)]
   [string]$FilterMonth,
   [Parameter(ParameterSetName='ExplicitMonth', Mandatory=$true)]
-  [int]$FilterYear
+  [int]$FilterYear,
+
+  # Optional: write a JSON changelog of the delta
+  [string]$DeltaJsonPath
 )
 
 function Remove-Html {
@@ -456,6 +461,106 @@ function Sort-ByOutputOrder {
     'Title'
 }
 
+# --- Delta tracking helpers ---
+function Compare-RowFields {
+  <#
+    Returns a hashtable of changed fields for an Updated row:
+      @{ FieldName = @{ Old = <val>; New = <val> }; ... }
+    No return or empty hashtable → no change.
+  #>
+  param(
+    [Parameter(Mandatory)][psobject]$Old,
+    [Parameter(Mandatory)][psobject]$New
+  )
+  $diff = @{}
+  $cols = @('Title','Genre','Premiere','Network','ImdbRating','ImdbVotes','ImdbId')
+  foreach ($c in $cols) {
+    $ov = $Old.$c
+    $nv = $New.$c
+    # Normalize numeric compares for rating/votes
+    if ($c -eq 'ImdbRating') {
+      $od=[double]::NaN; $nd=[double]::NaN
+      $oIsNum = [double]::TryParse($ov,[ref]$od)
+      $nIsNum = [double]::TryParse($nv,[ref]$nd)
+      if ($oIsNum -and $nIsNum) {
+        if ($od -ne $nd) { $diff[$c] = @{ Old = $ov; New = $nv } }
+      } else {
+        if (("$ov") -ne ("$nv")) { $diff[$c] = @{ Old = $ov; New = $nv } }
+      }
+    }
+    elseif ($c -eq 'ImdbVotes') {
+      $oi=[int]::MinValue; $ni=[int]::MinValue
+      $oIsNum = [int]::TryParse($ov,[ref]$oi)
+      $nIsNum = [int]::TryParse($nv,[ref]$ni)
+      if ($oIsNum -and $nIsNum) {
+        if ($oi -ne $ni) { $diff[$c] = @{ Old = $ov; New = $nv } }
+      } else {
+        if (("$ov") -ne ("$nv")) { $diff[$c] = @{ Old = $ov; New = $nv } }
+      }
+    }
+    else {
+      if (("$ov") -ne ("$nv")) { $diff[$c] = @{ Old = $ov; New = $nv } }
+    }
+  }
+  return $diff
+}
+
+function Get-DeltaReport {
+  <#
+    Compares existing vs new (both shaped rows).
+    Returns a PSCustomObject with:
+      - Added:    array of rows (new only)
+      - Updated:  array of @{ Key; Old; New; Diff }
+      - Removed:  array of rows (in existing but not in new) -- NOT deleted from CSV
+  #>
+  param(
+    [Parameter(Mandatory)][object[]]$Existing,
+    [Parameter(Mandatory)][object[]]$New
+  )
+
+  $mapOld = @{}
+  foreach ($r in $Existing) { if ($r) { $k = Get-IdentityKey -Row $r; if ($k) { $mapOld[$k] = $r } } }
+
+  $mapNew = @{}
+  foreach ($r in $New) { if ($r) { $k = Get-IdentityKey -Row $r; if ($k) { $mapNew[$k] = $r } } }
+
+  $added = New-Object System.Collections.Generic.List[object]
+  $updated = New-Object System.Collections.Generic.List[object]
+  $removed = New-Object System.Collections.Generic.List[object]
+
+  # Added + Updated
+  foreach ($k in $mapNew.Keys) {
+    if (-not $mapOld.ContainsKey($k)) {
+      $added.Add($mapNew[$k]) | Out-Null
+    } else {
+      $old = $mapOld[$k]
+      $new = $mapNew[$k]
+      $diff = Compare-RowFields -Old $old -New $new
+      if ($diff.Count -gt 0) {
+        $updated.Add([pscustomobject]@{
+          Key  = $k
+          Old  = $old
+          New  = $new
+          Diff = $diff
+        }) | Out-Null
+      }
+    }
+  }
+
+  # Removed (not seen this run)
+  foreach ($k in $mapOld.Keys) {
+    if (-not $mapNew.ContainsKey($k)) {
+      $removed.Add($mapOld[$k]) | Out-Null
+    }
+  }
+
+  [pscustomobject]@{
+    Added   = $added.ToArray()
+    Updated = $updated.ToArray()
+    Removed = $removed.ToArray()
+  }
+}
+
 # --- Main scrape across one or more URLs ---
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
 
@@ -645,36 +750,52 @@ $dedupNew = if ($shapeNew.Count -gt 0) { Dedup-ByKey -Rows $shapeNew } else { @(
 # Emit current run to console
 $dedupNew
 
-# --- Write to CSV (merge + dedup + STRONG SORT on write) ---
+# --- Read existing (for delta + merge) ---
+$existing = @()
+if (Test-Path $OutputCsv) {
+  try   { $existing = @((Import-Csv $OutputCsv)) }
+  catch { Write-Warning ("Failed to read existing CSV '{0}': {1}" -f $OutputCsv, $_.Exception.Message) }
+}
+$shapeExisting = if ($existing.Count -gt 0) { Select-OutputShape -Rows $existing } else { @() }
+
+# --- Delta tracking (compare shaped existing vs shaped new) ---
+$delta = Get-DeltaReport -Existing $shapeExisting -New $dedupNew
+
+# Print concise delta summary
+$addedCount   = ($delta.Added   | Measure-Object).Count
+$updatedCount = ($delta.Updated | Measure-Object).Count
+$removedCount = ($delta.Removed | Measure-Object).Count
+Write-Host ("[Delta] Added: {0}; Updated: {1}; Removed (not seen this run, kept in CSV): {2}" -f $addedCount, $updatedCount, $removedCount)
+
+# Optionally write JSON changelog
+if ($DeltaJsonPath) {
+  try {
+    $dir = Split-Path -Parent $DeltaJsonPath
+    if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
+    $delta | ConvertTo-Json -Depth 6 | Out-File -FilePath $DeltaJsonPath -Encoding UTF8
+    Write-Host ("[Delta] Wrote changelog to {0}" -f $DeltaJsonPath)
+  } catch {
+    Write-Warning ("Failed to write delta JSON '{0}': {1}" -f $DeltaJsonPath, $_.Exception.Message)
+  }
+}
+
+# --- Merge + de-dup map (new rows override existing), then strong sort and write ---
 if ($OutputCsv) {
   $dir = Split-Path -Parent $OutputCsv
   if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
 
-  # New rows from this run (already shaped & de-duped earlier)
-  $newRows = @($dedupNew)
-
-  # Existing rows (if any)
-  $existing = @()
-  if (Test-Path $OutputCsv) {
-    try   { $existing = @((Import-Csv $OutputCsv)) }
-    catch { Write-Warning ("Failed to read existing CSV '{0}': {1}" -f $OutputCsv, $_.Exception.Message) }
-  }
-  $shapeExisting = if ($existing.Count -gt 0) { Select-OutputShape -Rows $existing } else { @() }
-
-  # Build map (identity key → row). New rows override existing rows with the same key.
   $map = @{}
   foreach ($r in $shapeExisting) {
     if (-not $r) { continue }
     $k = Get-IdentityKey -Row $r
     if ($k) { $map[$k] = $r }
   }
-  foreach ($r in $newRows) {
+  foreach ($r in $dedupNew) {
     if (-not $r) { continue }
     $k = Get-IdentityKey -Row $r
     if ($k) { $map[$k] = $r }
   }
 
-  # Sort ENTIRE merged set by Rating DESC → Votes DESC → Premiere ASC → Title ASC
   $merged    = @($map.Values)
   $sortedAll = if ($merged.Count -gt 0) { Sort-ByOutputOrder -Rows $merged } else { @() }
 
@@ -687,5 +808,5 @@ if ($OutputCsv) {
     }
   }
 
-  Write-Host ("Merged {0} existing + {1} new → wrote {2} total row(s); fully resorted by rating DESC, votes DESC, premiere ASC, title ASC." -f $shapeExisting.Count, $newRows.Count, $sortedAll.Count)
+  Write-Host ("Merged {0} existing + {1} new → wrote {2} total row(s); fully resorted by rating DESC, votes DESC, premiere ASC, title ASC." -f $shapeExisting.Count, $dedupNew.Count, $sortedAll.Count)
 }
