@@ -20,6 +20,8 @@
       4) Title ASC
   - Delta tracking: prints counts of Added / Updated / Removed-not-seen-this-run,
     and can optionally emit a JSON changelog via -DeltaJsonPath.
+  - Persistent IMDb cache (DEFAULT ON): disk-backed JSON cache for IMDb lookups to reduce re-requests.
+    Disable with -NoPersistentCache. Control staleness with -CacheMaxAgeDays. Change file via -ImdbCachePath.
 
 .OUTPUT
   Objects with Title, Genre, Premiere, Network, ImdbRating, ImdbVotes, ImdbId
@@ -60,8 +62,13 @@ param(
   [Parameter(ParameterSetName='ExplicitMonth', Mandatory=$true)]
   [int]$FilterYear,
 
-  # Optional: write a JSON changelog of the delta
-  [string]$DeltaJsonPath
+  # Delta changelog (optional)
+  [string]$DeltaJsonPath,
+
+  # Persistent cache controls (DEFAULT ON)
+  [switch]$NoPersistentCache,
+  [string]$ImdbCachePath,
+  [int]$CacheMaxAgeDays = 21
 )
 
 function Remove-Html {
@@ -132,19 +139,13 @@ function Get-NetworkFromUrlTitle {
 # Find where the “Upcoming” section begins for a page
 function Get-CutoffIndex {
   param([Parameter(Mandatory)][string]$Html, [string]$Url)
-  $ids = @(
-    'Upcoming[_\s]original[_\s]programming',  # Netflix phrasing
-    'Upcoming[_\s]programming'                # HBO/HBO Max/Apple TV+ phrasing
-  )
+  $ids = @('Upcoming[_\s]original[_\s]programming','Upcoming[_\s]programming')
   foreach ($id in $ids) {
     $re = [regex]::new('id\s*=\s*["'']' + $id + '["'']', 'IgnoreCase')
     $m = $re.Match($Html)
     if ($m.Success) { return $m.Index }
   }
-  $txts = @(
-    '>\s*Upcoming\s+original\s+programming\s*<',
-    '>\s*Upcoming\s+programming\s*<'
-  )
+  $txts = @('>\s*Upcoming\s+original\s+programming\s*<','>\s*Upcoming\s+programming\s*<')
   foreach ($pat in $txts) {
     $re = [regex]::new($pat, 'IgnoreCase')
     $m = $re.Match($Html)
@@ -461,13 +462,108 @@ function Sort-ByOutputOrder {
     'Title'
 }
 
+# === Persistent Cache Helpers (DEFAULT ON) ===
+function Get-DefaultCachePath {
+  $base = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } elseif ($env:TEMP) { $env:TEMP } else { $pwd.Path }
+  $dir  = Join-Path $base 'TvScrape'
+  if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
+  Join-Path $dir 'imdb-cache.json'
+}
+
+function Load-PersistentCache {
+  param([Parameter(Mandatory)][string]$Path)
+  $map = @{}
+  if (Test-Path $Path) {
+    try {
+      $json = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
+      $arr  = @($json)
+      foreach ($it in $arr) {
+        if ($null -ne $it -and $it.PSObject.Properties.Match('Key').Count -gt 0) {
+          $map[$it.Key] = [pscustomobject]@{
+            Status   = $it.Status
+            Id       = $it.Id
+            Rating   = $it.Rating
+            Votes    = $it.Votes
+            CachedAt = $it.CachedAt
+          }
+        }
+      }
+      Write-Host ("[Cache] Loaded {0} entries from {1}" -f $map.Count, $Path)
+    } catch {
+      Write-Warning ("[Cache] Failed to load '{0}': {1}" -f $Path, $_.Exception.Message)
+    }
+  }
+  return $map
+}
+
+function Save-PersistentCache {
+  param(
+    [Parameter(Mandatory)][hashtable]$Map,
+    [Parameter(Mandatory)][string]$Path
+  )
+  try {
+    $dir = Split-Path -Parent $Path
+    if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
+    $list = foreach ($k in $Map.Keys) {
+      $v = $Map[$k]
+      [pscustomobject]@{
+        Key      = $k
+        Status   = $v.Status
+        Id       = $v.Id
+        Rating   = $v.Rating
+        Votes    = $v.Votes
+        CachedAt = $v.CachedAt
+      }
+    }
+    $list | ConvertTo-Json -Depth 5 | Out-File -FilePath $Path -Encoding UTF8
+    Write-Host ("[Cache] Saved {0} entries to {1}" -f $Map.Count, $Path)
+  } catch {
+    Write-Warning ("[Cache] Failed to save '{0}': {1}" -f $Path, $_.Exception.Message)
+  }
+}
+
+function Is-CacheEntryFresh {
+  param(
+    [Parameter(Mandatory)][psobject]$Entry,
+    [Parameter(Mandatory)][int]$MaxAgeDays
+  )
+  if (-not $Entry.CachedAt) { return $false }
+  try {
+    $t = [datetime]::Parse($Entry.CachedAt).ToUniversalTime()
+    $age = (Get-Date).ToUniversalTime() - $t
+    return ($age.TotalDays -lt $MaxAgeDays)
+  } catch { return $false }
+}
+
+function To-AssessmentFromCache {
+  param([Parameter(Mandatory)][psobject]$Entry)
+  # Return same shape used elsewhere
+  $ht = @{
+    Status = $Entry.Status
+    Id     = $Entry.Id
+    Rating = $Entry.Rating
+    Votes  = $Entry.Votes
+  }
+  return $ht
+}
+
+function Update-PersistentCacheEntry {
+  param(
+    [Parameter(Mandatory)][hashtable]$Cache,
+    [Parameter(Mandatory)][string]$Key,
+    [Parameter(Mandatory)][hashtable]$Assessment
+  )
+  $Cache[$Key] = [pscustomobject]@{
+    Status   = $Assessment.Status
+    Id       = $Assessment.Id
+    Rating   = $Assessment.Rating
+    Votes    = $Assessment.Votes
+    CachedAt = (Get-Date).ToUniversalTime().ToString('o')
+  }
+}
+
 # --- Delta tracking helpers ---
 function Compare-RowFields {
-  <#
-    Returns a hashtable of changed fields for an Updated row:
-      @{ FieldName = @{ Old = <val>; New = <val> }; ... }
-    No return or empty hashtable → no change.
-  #>
   param(
     [Parameter(Mandatory)][psobject]$Old,
     [Parameter(Mandatory)][psobject]$New
@@ -477,42 +573,26 @@ function Compare-RowFields {
   foreach ($c in $cols) {
     $ov = $Old.$c
     $nv = $New.$c
-    # Normalize numeric compares for rating/votes
     if ($c -eq 'ImdbRating') {
       $od=[double]::NaN; $nd=[double]::NaN
       $oIsNum = [double]::TryParse($ov,[ref]$od)
       $nIsNum = [double]::TryParse($nv,[ref]$nd)
-      if ($oIsNum -and $nIsNum) {
-        if ($od -ne $nd) { $diff[$c] = @{ Old = $ov; New = $nv } }
-      } else {
-        if (("$ov") -ne ("$nv")) { $diff[$c] = @{ Old = $ov; New = $nv } }
-      }
+      if ($oIsNum -and $nIsNum) { if ($od -ne $nd) { $diff[$c] = @{ Old=$ov; New=$nv } } }
+      else { if (("$ov") -ne ("$nv")) { $diff[$c] = @{ Old=$ov; New=$nv } } }
     }
     elseif ($c -eq 'ImdbVotes') {
       $oi=[int]::MinValue; $ni=[int]::MinValue
       $oIsNum = [int]::TryParse($ov,[ref]$oi)
       $nIsNum = [int]::TryParse($nv,[ref]$ni)
-      if ($oIsNum -and $nIsNum) {
-        if ($oi -ne $ni) { $diff[$c] = @{ Old = $ov; New = $nv } }
-      } else {
-        if (("$ov") -ne ("$nv")) { $diff[$c] = @{ Old = $ov; New = $nv } }
-      }
+      if ($oIsNum -and $nIsNum) { if ($oi -ne $ni) { $diff[$c] = @{ Old=$ov; New=$nv } } }
+      else { if (("$ov") -ne ("$nv")) { $diff[$c] = @{ Old=$ov; New=$nv } } }
     }
-    else {
-      if (("$ov") -ne ("$nv")) { $diff[$c] = @{ Old = $ov; New = $nv } }
-    }
+    else { if (("$ov") -ne ("$nv")) { $diff[$c] = @{ Old=$ov; New=$nv } } }
   }
   return $diff
 }
 
 function Get-DeltaReport {
-  <#
-    Compares existing vs new (both shaped rows).
-    Returns a PSCustomObject with:
-      - Added:    array of rows (new only)
-      - Updated:  array of @{ Key; Old; New; Diff }
-      - Removed:  array of rows (in existing but not in new) -- NOT deleted from CSV
-  #>
   param(
     [Parameter(Mandatory)][object[]]$Existing,
     [Parameter(Mandatory)][object[]]$New
@@ -528,37 +608,22 @@ function Get-DeltaReport {
   $updated = New-Object System.Collections.Generic.List[object]
   $removed = New-Object System.Collections.Generic.List[object]
 
-  # Added + Updated
   foreach ($k in $mapNew.Keys) {
     if (-not $mapOld.ContainsKey($k)) {
       $added.Add($mapNew[$k]) | Out-Null
     } else {
-      $old = $mapOld[$k]
-      $new = $mapNew[$k]
+      $old = $mapOld[$k]; $new = $mapNew[$k]
       $diff = Compare-RowFields -Old $old -New $new
       if ($diff.Count -gt 0) {
-        $updated.Add([pscustomobject]@{
-          Key  = $k
-          Old  = $old
-          New  = $new
-          Diff = $diff
-        }) | Out-Null
+        $updated.Add([pscustomobject]@{ Key=$k; Old=$old; New=$new; Diff=$diff }) | Out-Null
       }
     }
   }
-
-  # Removed (not seen this run)
   foreach ($k in $mapOld.Keys) {
-    if (-not $mapNew.ContainsKey($k)) {
-      $removed.Add($mapOld[$k]) | Out-Null
-    }
+    if (-not $mapNew.ContainsKey($k)) { $removed.Add($mapOld[$k]) | Out-Null }
   }
 
-  [pscustomobject]@{
-    Added   = $added.ToArray()
-    Updated = $updated.ToArray()
-    Removed = $removed.ToArray()
-  }
+  [pscustomobject]@{ Added=$added.ToArray(); Updated=$updated.ToArray(); Removed=$removed.ToArray() }
 }
 
 # --- Main scrape across one or more URLs ---
@@ -596,11 +661,17 @@ switch ($PSCmdlet.ParameterSetName) {
   default { }
 }
 
-$imdbCache = @{}
+# Initialize caches
+$usePersistentCache = -not $NoPersistentCache.IsPresent
+$effectiveCachePath = if ($ImdbCachePath) { $ImdbCachePath } else { Get-DefaultCachePath }
+$persistCache = @{}
+$cacheDirty = $false
+if ($usePersistentCache) { $persistCache = Load-PersistentCache -Path $effectiveCachePath }
+
+$imdbCache = @{}   # in-memory for this run (filled from persistent or fresh lookups)
 $results = New-Object System.Collections.Generic.List[object]
 
 foreach ($Url in $Urls) {
-  # Download
   try {
     $resp = Invoke-Http -Uri $Url
     $html = $resp.Content
@@ -609,7 +680,6 @@ foreach ($Url in $Urls) {
     continue
   }
 
-  # Determine network/service name
   $networkName = Get-NetworkFromUrlTitle -Url $Url
   if (-not $networkName) {
     if     ($Url -match '(?i)hbo[_\s]*max')                 { $networkName = 'HBO Max' }
@@ -628,22 +698,19 @@ foreach ($Url in $Urls) {
     else                                                    { $networkName = 'Unknown' }
   }
 
-  # Cutoff for Upcoming
   $cutoffIdx = Get-CutoffIndex -Html $html -Url $Url
 
   foreach ($t in $tableRe.Matches($html)) {
-    if ($cutoffIdx -ge 0 -and $t.Index -ge $cutoffIdx) { continue }  # skip "Upcoming" and after
+    if ($cutoffIdx -ge 0 -and $t.Index -ge $cutoffIdx) { continue }
 
     $tableHtml = $t.Value
 
-    # Header row
     $headerRow = $null
     foreach ($tr in $trRe.Matches($tableHtml)) {
       if ($tr.Value -match '<th\b' -and -not ($tr.Value -match 'scope\s*=\s*["'']row["'']')) { $headerRow = $tr.Value; break }
     }
     if (-not $headerRow) { continue }
 
-    # Headers
     $headers = @()
     foreach ($m in $thRe.Matches($headerRow)) {
       $h = Remove-Html $m.Groups[1].Value
@@ -651,7 +718,6 @@ foreach ($Url in $Urls) {
     }
     if (-not $headers) { continue }
 
-    # Column indexes
     $findIndex = {
       param($pattern)
       for ($i=0; $i -lt $headers.Count; $i++) { if ($headers[$i] -match $pattern) { return $i } }
@@ -668,7 +734,6 @@ foreach ($Url in $Urls) {
     foreach ($tr in $trRe.Matches($tableHtml)) {
       if ($tr.Value -match '<th\b' -and -not ($tr.Value -match 'scope\s*=\s*["'']row["'']')) { continue }
 
-      # Cells (raw + cleaned)
       $rawCells = @()
       $cells = @()
       foreach ($cm in $cellRe.Matches($tr.Value)) {
@@ -684,33 +749,48 @@ foreach ($Url in $Urls) {
       $premiere = $cells[$idxPremiere]
       if ([string]::IsNullOrWhiteSpace($title) -or [string]::IsNullOrWhiteSpace($premiere)) { continue }
 
-      # Title cell's Wikipedia href (first anchor)
       $titleHref = $null
       if ($idxTitle -lt $rawCells.Count) {
         $mHref = [regex]::Match($rawCells[$idxTitle], '<a[^>]+href="([^"#:]+)"', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
         if ($mHref.Success) { $titleHref = $mHref.Groups[1].Value }
       }
 
-      # Date filters
       $premDate = Get-PremiereDate $premiere
 
       if ($useMonthWindow) {
         if (-not $premDate) { continue }
         if ($premDate -lt $windowStart -or $premDate -ge $windowEndExclusive) { continue }
       } else {
-        # Default behavior: year + month/date present
         $hasYear        = ($premiere -match $yearPattern)
         $hasMonthOrDate = ($premiere -match $monthPattern) -or ($premiere -match $isoDatePattern) -or ($premiere -match $usDatePattern)
         if (-not ($hasYear -and $hasMonthOrDate)) { continue }
       }
 
-      # IMDb lookup (cached per-network+title)
+      # --- IMDb lookup with persistent cache ---
       $premYear = if ($premDate) { $premDate.Year } else { Get-FirstYearFromText $premiere }
-      $cacheKey = "$networkName|$title"
-      if (-not $imdbCache.ContainsKey($cacheKey)) {
-        $imdbCache[$cacheKey] = Get-ImdbAssessment -Title $title -PremiereYear $premYear -DelayMs $RequestDelayMs -TitleHref $titleHref -NetworkHint $networkName
+      $imdbKey  = "{0}|{1}" -f $networkName, $title
+
+      if (-not $imdbCache.ContainsKey($imdbKey)) {
+        $usedCache = $false
+        if ($usePersistentCache -and $persistCache.ContainsKey($imdbKey)) {
+          $entry = $persistCache[$imdbKey]
+          if (Is-CacheEntryFresh -Entry $entry -MaxAgeDays $CacheMaxAgeDays) {
+            $imdbCache[$imdbKey] = To-AssessmentFromCache -Entry $entry
+            $usedCache = $true
+          }
+        }
+
+        if (-not $usedCache) {
+          $assess = Get-ImdbAssessment -Title $title -PremiereYear $premYear -DelayMs $RequestDelayMs -TitleHref $titleHref -NetworkHint $networkName
+          $imdbCache[$imdbKey] = $assess
+          if ($usePersistentCache) {
+            Update-PersistentCacheEntry -Cache $persistCache -Key $imdbKey -Assessment $assess
+            $cacheDirty = $true
+          }
+        }
       }
-      $assessment = $imdbCache[$cacheKey]
+
+      $assessment = $imdbCache[$imdbKey]
 
       if ($assessment.Status -eq 'ok') {
         $meets = ($assessment.Rating -ge $MinRating -and $assessment.Votes -ge $MinVotes)
@@ -742,7 +822,7 @@ foreach ($Url in $Urls) {
   }
 }
 
-# Shape and de-dup the current run (no pre-sort; sort happens at CSV write)
+# Shape + de-dup current run
 $runRows  = if ($results) { $results.ToArray() } else { @() }
 $shapeNew = if ($runRows.Count -gt 0) { Select-OutputShape -Rows $runRows } else { @() }
 $dedupNew = if ($shapeNew.Count -gt 0) { Dedup-ByKey -Rows $shapeNew } else { @() }
@@ -750,7 +830,7 @@ $dedupNew = if ($shapeNew.Count -gt 0) { Dedup-ByKey -Rows $shapeNew } else { @(
 # Emit current run to console
 $dedupNew
 
-# --- Read existing (for delta + merge) ---
+# Read existing (for delta + merge)
 $existing = @()
 if (Test-Path $OutputCsv) {
   try   { $existing = @((Import-Csv $OutputCsv)) }
@@ -758,16 +838,13 @@ if (Test-Path $OutputCsv) {
 }
 $shapeExisting = if ($existing.Count -gt 0) { Select-OutputShape -Rows $existing } else { @() }
 
-# --- Delta tracking (compare shaped existing vs shaped new) ---
+# Delta tracking
 $delta = Get-DeltaReport -Existing $shapeExisting -New $dedupNew
-
-# Print concise delta summary
 $addedCount   = ($delta.Added   | Measure-Object).Count
 $updatedCount = ($delta.Updated | Measure-Object).Count
 $removedCount = ($delta.Removed | Measure-Object).Count
 Write-Host ("[Delta] Added: {0}; Updated: {1}; Removed (not seen this run, kept in CSV): {2}" -f $addedCount, $updatedCount, $removedCount)
 
-# Optionally write JSON changelog
 if ($DeltaJsonPath) {
   try {
     $dir = Split-Path -Parent $DeltaJsonPath
@@ -779,22 +856,14 @@ if ($DeltaJsonPath) {
   }
 }
 
-# --- Merge + de-dup map (new rows override existing), then strong sort and write ---
+# Merge + strong sort + write CSV
 if ($OutputCsv) {
   $dir = Split-Path -Parent $OutputCsv
   if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
 
   $map = @{}
-  foreach ($r in $shapeExisting) {
-    if (-not $r) { continue }
-    $k = Get-IdentityKey -Row $r
-    if ($k) { $map[$k] = $r }
-  }
-  foreach ($r in $dedupNew) {
-    if (-not $r) { continue }
-    $k = Get-IdentityKey -Row $r
-    if ($k) { $map[$k] = $r }
-  }
+  foreach ($r in $shapeExisting) { if ($r) { $k = Get-IdentityKey -Row $r; if ($k) { $map[$k] = $r } } }
+  foreach ($r in $dedupNew)     { if ($r) { $k = Get-IdentityKey -Row $r; if ($k) { $map[$k] = $r } } }
 
   $merged    = @($map.Values)
   $sortedAll = if ($merged.Count -gt 0) { Sort-ByOutputOrder -Rows $merged } else { @() }
@@ -809,4 +878,9 @@ if ($OutputCsv) {
   }
 
   Write-Host ("Merged {0} existing + {1} new → wrote {2} total row(s); fully resorted by rating DESC, votes DESC, premiere ASC, title ASC." -f $shapeExisting.Count, $dedupNew.Count, $sortedAll.Count)
+}
+
+# Save persistent cache if changed
+if ($usePersistentCache -and $cacheDirty) {
+  Save-PersistentCache -Map $persistCache -Path $effectiveCachePath
 }
