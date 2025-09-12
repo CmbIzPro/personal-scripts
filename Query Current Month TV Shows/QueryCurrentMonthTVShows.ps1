@@ -22,10 +22,10 @@
     and can optionally emit a JSON changelog via -DeltaJsonPath.
   - Persistent IMDb cache (DEFAULT ON): disk-backed JSON cache for IMDb lookups to reduce re-requests.
     Disable with -NoPersistentCache. Control staleness with -CacheMaxAgeDays. Change file via -ImdbCachePath.
-  - Robust HTTP: automatic retry with exponential backoff (+ optional jitter), honoring Retry-After when sent.
+  - Stable IDs: emits and caches WikidataQid when discoverable (from title link or title).
 
 .OUTPUT
-  Objects with Title, Genre, Premiere, Network, ImdbRating, ImdbVotes, ImdbId
+  Objects with Title, Genre, Premiere, Network, ImdbRating, ImdbVotes, ImdbId, WikidataQid
 #>
 
 [CmdletBinding(DefaultParameterSetName='Default')]
@@ -69,15 +69,35 @@ param(
   # Persistent cache controls (DEFAULT ON)
   [switch]$NoPersistentCache,
   [string]$ImdbCachePath,
-  [int]$CacheMaxAgeDays = 21,
-
-  # --- New: HTTP retry/backoff controls ---
-  [int]$MaxHttpRetries    = 4,     # total tries = 1 initial + MaxHttpRetries retries
-  [int]$HttpBackoffBaseMs = 300,   # first backoff delay (ms)
-  [int]$HttpBackoffMaxMs  = 8000,  # cap the backoff delay (ms)
-  [int]$HttpTimeoutSec    = 30,    # per-attempt timeout for Invoke-WebRequest (if supported)
-  [switch]$HttpJitter              # add ±25% jitter to backoff delays
+  [int]$CacheMaxAgeDays = 21
 )
+
+# --- HTTP with retry + jitter (exponential backoff) ---
+function Invoke-HttpWithRetry {
+  param(
+    [Parameter(Mandatory)][string]$Uri,
+    [int]$MaxAttempts = 4,
+    [int]$BaseDelayMs = 300
+  )
+  $attempt = 0
+  while ($true) {
+    $attempt++
+    try {
+      return Invoke-WebRequest -Uri $Uri -Headers @{
+        'User-Agent'      = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) PowerShell scraper'
+        'Accept-Language' = 'en-US,en;q=0.9'
+      } -ErrorAction Stop
+    } catch {
+      if ($attempt -ge $MaxAttempts) { throw }
+      $pow = [Math]::Pow(2, ($attempt - 1))
+      $jitter = Get-Random -Minimum 50 -Maximum 250
+      $delay = [int]($BaseDelayMs * $pow + $jitter)
+      Write-Warning ("HTTP attempt {0}/{1} failed for {2}: {3}. Retrying in {4} ms..." -f $attempt, $MaxAttempts, $Uri, $_.Exception.Message, $delay)
+      Start-Sleep -Milliseconds $delay
+    }
+  }
+}
+function Invoke-Http { param([Parameter(Mandatory)][string]$Uri) Invoke-HttpWithRetry -Uri $Uri }
 
 function Remove-Html {
   param([string]$Html)
@@ -121,89 +141,6 @@ function Get-FirstYearFromText {
   if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
   $m = [regex]::Match($Text, '\b(19|20)\d{2}\b')
   if ($m.Success) { [int]$m.Value } else { $null }
-}
-
-# --- New: Robust HTTP with retry/backoff ---
-function Invoke-Http {
-  param(
-    [Parameter(Mandatory)][string]$Uri,
-    [int]$MaxRetries  = $MaxHttpRetries,
-    [int]$BaseDelayMs = $HttpBackoffBaseMs,
-    [int]$MaxDelayMs  = $HttpBackoffMaxMs,
-    [int]$TimeoutSec  = $HttpTimeoutSec
-  )
-
-  # Local RNG for jitter (safe across runspaces)
-  $rand = [System.Random]::new()
-
-  function Get-BackoffDelayMs {
-    param([int]$Attempt)
-    $delay = [int]([Math]::Min($MaxDelayMs, [Math]::Round($BaseDelayMs * [Math]::Pow(2, $Attempt-1))))
-    if ($HttpJitter.IsPresent) {
-      $factor = 0.75 + ($rand.NextDouble() * 0.5)   # 0.75 .. 1.25
-      $delay  = [int]([Math]::Min($MaxDelayMs, [Math]::Round($delay * $factor)))
-    }
-    return [Math]::Max(0, $delay)
-  }
-
-  $attempt = 0
-  while ($true) {
-    try {
-      $iwParams = @{
-        Uri         = $Uri
-        Headers     = @{
-          'User-Agent'      = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) PowerShell scraper'
-          'Accept-Language' = 'en-US,en;q=0.9'
-        }
-        ErrorAction = 'Stop'
-      }
-      # Use TimeoutSec if the host supports it (PowerShell 7+)
-      $iwCmd = Get-Command Invoke-WebRequest -ErrorAction SilentlyContinue
-      if ($iwCmd -and $iwCmd.Parameters.ContainsKey('TimeoutSec')) {
-        $iwParams['TimeoutSec'] = $TimeoutSec
-      }
-      return Invoke-WebRequest @iwParams
-    }
-    catch {
-      $attempt++
-
-      # Extract status & Retry-After
-      $statusCode  = $null
-      $retryAfterS = $null
-      try {
-        if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
-          $statusCode = [int]$_.Exception.Response.StatusCode
-          try {
-            $retryAfterHeader = $_.Exception.Response.Headers['Retry-After']
-            if ($retryAfterHeader) {
-              [int]$secsParsed = 0
-              if ([int]::TryParse("$retryAfterHeader", [ref]$secsParsed)) { $retryAfterS = $secsParsed }
-            }
-          } catch { }
-        }
-      } catch { }
-
-      # Should we retry?
-      $shouldRetry = $true
-      if ($statusCode) {
-        if ($statusCode -ge 400 -and $statusCode -lt 500 -and $statusCode -ne 408 -and $statusCode -ne 429) {
-          $shouldRetry = $false
-        }
-      }
-
-      if (-not $shouldRetry -or $attempt -gt $MaxRetries) {
-        throw  # give up
-      }
-
-      # Honor Retry-After if present, else exponential backoff
-      if ($retryAfterS) {
-        Start-Sleep -Seconds $retryAfterS
-      } else {
-        $delayMs = Get-BackoffDelayMs -Attempt $attempt
-        Start-Sleep -Milliseconds $delayMs
-      }
-    }
-  }
 }
 
 # Determine Network/Service from URL title
@@ -367,9 +304,10 @@ function Get-ImdbRating {
 function Get-ImdbAssessment {
   <#
     Returns:
-      @{ Status='ok'; Id='tt…'; Rating=[double]; Votes=[int] }
+      @{ Status='ok'; Id='tt…'; Rating=[double]; Votes=[int]; Qid=[string|null] }
       @{ Status='not_found' } / @{ Status='error' }
     Tries: IMDb suggestion → IMDb find → Wikidata P345 → Wikipedia ext. link → web search
+    Better title disambiguation: prefer TV entries; down-rank "(film)"; consider year closeness; use NetworkHint.
   #>
   param(
     [Parameter(Mandatory)] [string]$Title,
@@ -379,27 +317,48 @@ function Get-ImdbAssessment {
     [string]$NetworkHint
   )
 
+  # Pre-get QID from enwiki when possible (helps cache + output)
+  $qid = $null
+  try {
+    if ($TitleHref) {
+      $pageTitle = Get-WikiTitleFromHref $TitleHref
+      if ($pageTitle) { $qid = Get-WikidataQidFromEnwikiTitle -EnwikiTitle $pageTitle -DelayMs $DelayMs }
+    }
+    if (-not $qid) {
+      $qid = Get-WikidataQidFromEnwikiTitle -EnwikiTitle $Title -DelayMs $DelayMs
+    }
+  } catch {}
+
   try {
     foreach ($queryTitle in @($Title, (Clean-TitleForSearch $Title))) {
       if ([string]::IsNullOrWhiteSpace($queryTitle)) { continue }
       try {
         $firstLetter = ($queryTitle.Trim())[0].ToString().ToLower()
         $sugUrl = "https://v2.sg.media-imdb.com/suggestion/$firstLetter/" + [System.Uri]::EscapeDataString($queryTitle) + ".json"
+        Start-Sleep -Milliseconds $DelayMs
         $sugResp = Invoke-Http -Uri $sugUrl
         $json = $sugResp.Content | ConvertFrom-Json
         if ($json -and $json.d) {
           $scored = foreach ($d in $json.d) {
             if (-not ($d.id -match '^tt\d+')) { continue }
+            # score heuristics
             $score = 0
-            if ($d.l -eq $queryTitle) { $score += 2 }
-            if ($PremiereYear -and $d.y -eq $PremiereYear) { $score += 3 }
-            elseif ($PremiereYear -and $d.yr -and ($d.yr -match [regex]::Escape("$PremiereYear"))) { $score += 2 }
-            if ($d.q -match '(?i)TV') { $score += 1 }
-            [pscustomobject]@{ Id=$d.id; Score=$score }
+            if ($d.l -eq $queryTitle) { $score += 2 }                            # exact title
+            if ($PremiereYear -and $d.y -eq $PremiereYear) { $score += 3 }       # exact year
+            elseif ($PremiereYear -and $d.y -and [math]::Abs($d.y - $PremiereYear) -le 1) { $score += 1 } # near year
+            if ($d.q -match '(?i)TV|Series|Mini') { $score += 2 }                # TV leaning
+            if ($d.q -match '(?i)film') { $score -= 2 }                          # down-rank films
+            if ($NetworkHint -and $d.s -and ($d.s -match [regex]::Escape($NetworkHint))) { $score += 1 } # hint in summary
+            [pscustomobject]@{ Id = $d.id; Score = $score }
           }
           if ($scored) {
             $ttId = ($scored | Sort-Object Score -Descending | Select-Object -First 1).Id
-            if ($ttId) { Start-Sleep -Milliseconds $DelayMs; return Get-ImdbRating -ImdbId $ttId }
+            if ($ttId) {
+              Start-Sleep -Milliseconds $DelayMs
+              $r = Get-ImdbRating -ImdbId $ttId
+              if ($r -and $r.Status -eq 'ok') { $r['Qid'] = $qid }
+              return $r
+            }
           }
         }
       } catch { }
@@ -407,37 +366,53 @@ function Get-ImdbAssessment {
 
     try {
       $findUrl = "https://www.imdb.com/find/?s=tt&q=" + [System.Uri]::EscapeDataString($Title)
+      Start-Sleep -Milliseconds $DelayMs
       $findResp = Invoke-Http -Uri $findUrl
       $m = [regex]::Match($findResp.Content, '/title/(tt\d+)/')
       if ($m.Success) {
         $ttId = $m.Groups[1].Value
         Start-Sleep -Milliseconds $DelayMs
-        return Get-ImdbRating -ImdbId $ttId
+        $r = Get-ImdbRating -ImdbId $ttId
+        if ($r -and $r.Status -eq 'ok') { $r['Qid'] = $qid }
+        return $r
       }
     } catch { }
 
-    $qid = $null
-    if ($TitleHref) {
-      $pageTitle = Get-WikiTitleFromHref $TitleHref
-      if ($pageTitle) { $qid = Get-WikidataQidFromEnwikiTitle -EnwikiTitle $pageTitle -DelayMs $DelayMs }
+    if (-not $qid) {
+      # try again via enwiki (Title)
+      $qid = Get-WikidataQidFromEnwikiTitle -EnwikiTitle $Title -DelayMs $DelayMs
     }
-    if (-not $qid) { $qid = Get-WikidataQidFromEnwikiTitle -EnwikiTitle $Title -DelayMs $DelayMs }
     if ($qid) {
       $tt2 = Get-ImdbIdFromWikidataQid -Qid $qid -DelayMs $DelayMs
-      if ($tt2) { Start-Sleep -Milliseconds $DelayMs; return Get-ImdbRating -ImdbId $tt2 }
+      if ($tt2) {
+        Start-Sleep -Milliseconds $DelayMs
+        $r = Get-ImdbRating -ImdbId $tt2
+        if ($r -and $r.Status -eq 'ok') { $r['Qid'] = $qid }
+        return $r
+      }
     }
 
     if ($TitleHref) {
       $tt3 = Try-GetImdbIdFromWikipediaPage -WikiHref $TitleHref -DelayMs $DelayMs
-      if ($tt3) { Start-Sleep -Milliseconds $DelayMs; return Get-ImdbRating -ImdbId $tt3 }
+      if ($tt3) {
+        Start-Sleep -Milliseconds $DelayMs
+        $r = Get-ImdbRating -ImdbId $tt3
+        if ($r -and $r.Status -eq 'ok') { $r['Qid'] = $qid }
+        return $r
+      }
     }
 
     $tt4 = Try-GetImdbIdFromWebSearch -Title $Title -PremiereYear $PremiereYear -DelayMs $DelayMs -NetworkHint $NetworkHint
-    if ($tt4) { Start-Sleep -Milliseconds $DelayMs; return Get-ImdbRating -ImdbId $tt4 }
+    if ($tt4) {
+      Start-Sleep -Milliseconds $DelayMs
+      $r = Get-ImdbRating -ImdbId $tt4
+      if ($r -and $r.Status -eq 'ok') { $r['Qid'] = $qid }
+      return $r
+    }
 
-    return @{ Status='not_found' }
+    return @{ Status='not_found'; Qid=$qid }
   } catch {
-    return @{ Status='error' }
+    return @{ Status='error'; Qid=$qid }
   }
 }
 
@@ -496,7 +471,10 @@ function Resolve-MonthNumber {
 # --- Dedup & shape helpers ---
 function Select-OutputShape {
   param([Parameter(Mandatory)][object[]]$Rows)
-  $Rows | Select-Object Title, Genre, Premiere, Network, ImdbRating, ImdbVotes, ImdbId
+  if (-not $Rows) { return @() }
+  $rowsArr = @($Rows)
+  if ($rowsArr.Count -eq 0) { return @() }
+  $rowsArr | Select-Object Title, Genre, Premiere, Network, ImdbRating, ImdbVotes, ImdbId, WikidataQid
 }
 
 function Get-IdentityKey {
@@ -567,6 +545,7 @@ function Load-PersistentCache {
             Id       = $it.Id
             Rating   = $it.Rating
             Votes    = $it.Votes
+            Qid      = $it.Qid
             CachedAt = $it.CachedAt
           }
         }
@@ -595,6 +574,7 @@ function Save-PersistentCache {
         Id       = $v.Id
         Rating   = $v.Rating
         Votes    = $v.Votes
+        Qid      = $v.Qid
         CachedAt = $v.CachedAt
       }
     }
@@ -620,13 +600,13 @@ function Is-CacheEntryFresh {
 
 function To-AssessmentFromCache {
   param([Parameter(Mandatory)][psobject]$Entry)
-  $ht = @{
+  @{
     Status = $Entry.Status
     Id     = $Entry.Id
     Rating = $Entry.Rating
     Votes  = $Entry.Votes
+    Qid    = $Entry.Qid
   }
-  return $ht
 }
 
 function Update-PersistentCacheEntry {
@@ -640,6 +620,7 @@ function Update-PersistentCacheEntry {
     Id       = $Assessment.Id
     Rating   = $Assessment.Rating
     Votes    = $Assessment.Votes
+    Qid      = $Assessment.Qid
     CachedAt = (Get-Date).ToUniversalTime().ToString('o')
   }
 }
@@ -651,7 +632,7 @@ function Compare-RowFields {
     [Parameter(Mandatory)][psobject]$New
   )
   $diff = @{}
-  $cols = @('Title','Genre','Premiere','Network','ImdbRating','ImdbVotes','ImdbId')
+  $cols = @('Title','Genre','Premiere','Network','ImdbRating','ImdbVotes','ImdbId','WikidataQid')
   foreach ($c in $cols) {
     $ov = $Old.$c
     $nv = $New.$c
@@ -679,6 +660,9 @@ function Get-DeltaReport {
     [Parameter(Mandatory)][object[]]$Existing,
     [Parameter(Mandatory)][object[]]$New
   )
+
+  $Existing = @($Existing)
+  $New      = @($New)
 
   $mapOld = @{}
   foreach ($r in $Existing) { if ($r) { $k = Get-IdentityKey -Row $r; if ($k) { $mapOld[$k] = $r } } }
@@ -848,7 +832,7 @@ foreach ($Url in $Urls) {
         if (-not ($hasYear -and $hasMonthOrDate)) { continue }
       }
 
-      # --- IMDb lookup with persistent cache ---
+      # --- IMDb lookup with persistent cache + Qid support ---
       $premYear = if ($premDate) { $premDate.Year } else { Get-FirstYearFromText $premiere }
       $imdbKey  = "{0}|{1}" -f $networkName, $title
 
@@ -878,26 +862,28 @@ foreach ($Url in $Urls) {
         $meets = ($assessment.Rating -ge $MinRating -and $assessment.Votes -ge $MinVotes)
         if ($meets -or $IncludeBelowThreshold.IsPresent) {
           $results.Add([pscustomobject]@{
-            Title      = $title
-            Genre      = $genre
-            Premiere   = $premiere
-            Network    = $networkName
-            ImdbRating = [math]::Round($assessment.Rating, 1)
-            ImdbVotes  = $assessment.Votes
-            ImdbId     = $assessment.Id
+            Title       = $title
+            Genre       = $genre
+            Premiere    = $premiere
+            Network     = $networkName
+            ImdbRating  = [math]::Round($assessment.Rating, 1)
+            ImdbVotes   = $assessment.Votes
+            ImdbId      = $assessment.Id
+            WikidataQid = $assessment.Qid
           }) | Out-Null
         }
       }
       elseif ($assessment.Status -in @('not_found','error')) {
         $label = if ($assessment.Status -eq 'not_found') { 'IMDb not found' } else { 'IMDb lookup error' }
         $results.Add([pscustomobject]@{
-          Title      = $title
-          Genre      = $genre
-          Premiere   = $premiere
-          Network    = $networkName
-          ImdbRating = $label
-          ImdbVotes  = $null
-          ImdbId     = $null
+          Title       = $title
+          Genre       = $genre
+          Premiere    = $premiere
+          Network     = $networkName
+          ImdbRating  = $label
+          ImdbVotes   = $null
+          ImdbId      = $null
+          WikidataQid = $assessment.Qid
         }) | Out-Null
       }
     }
@@ -918,7 +904,11 @@ if (Test-Path $OutputCsv) {
   try   { $existing = @((Import-Csv $OutputCsv)) }
   catch { Write-Warning ("Failed to read existing CSV '{0}': {1}" -f $OutputCsv, $_.Exception.Message) }
 }
-$shapeExisting = if ($existing.Count -gt 0) { Select-OutputShape -Rows $existing } else { @() }
+$shapeExisting = if ($existing -and $existing.Count -gt 0) { Select-OutputShape -Rows $existing } else { @() }
+
+# Ensure arrays before delta (fixes null binding)
+$shapeExisting = @($shapeExisting)
+$dedupNew      = @($dedupNew)
 
 # Delta tracking
 $delta = Get-DeltaReport -Existing $shapeExisting -New $dedupNew
@@ -954,7 +944,7 @@ if ($OutputCsv) {
     $sortedAll | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $OutputCsv
   } else {
     if (-not (Test-Path $OutputCsv)) {
-      "" | Select-Object @{n='Title';e={}}, @{n='Genre';e={}}, @{n='Premiere';e={}}, @{n='Network';e={}}, @{n='ImdbRating';e={}}, @{n='ImdbVotes';e={}}, @{n='ImdbId';e={}} |
+      "" | Select-Object @{n='Title';e={}}, @{n='Genre';e={}}, @{n='Premiere';e={}}, @{n='Network';e={}}, @{n='ImdbRating';e={}}, @{n='ImdbVotes';e={}}, @{n='ImdbId';e={}}, @{n='WikidataQid';e={}} |
         Export-Csv -NoTypeInformation -Encoding UTF8 -Path $OutputCsv
     }
   }
