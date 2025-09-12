@@ -19,13 +19,13 @@
       3) Premiere date ASC
       4) Title ASC
   - Delta tracking: prints counts of Added / Updated / Removed-not-seen-this-run,
-    and can optionally emit a JSON changelog via -DeltaJsonPath.
+    optional JSON changelog via -DeltaJsonPath.
   - Persistent IMDb cache (DEFAULT ON): disk-backed JSON cache for IMDb lookups to reduce re-requests.
     Disable with -NoPersistentCache. Control staleness with -CacheMaxAgeDays. Change file via -ImdbCachePath.
-  - Stable IDs: emits and caches WikidataQid when discoverable (from title link or title).
+  - Delta columns in CSV: ChangeType, SeenThisRun, FirstSeen, LastSeen, PrevImdbRating, PrevImdbVotes, DeltaRating, DeltaVotes.
 
 .OUTPUT
-  Objects with Title, Genre, Premiere, Network, ImdbRating, ImdbVotes, ImdbId, WikidataQid
+  Objects with Title, Genre, Premiere, Network, ImdbRating, ImdbVotes, ImdbId, WikidataQid, and delta columns
 #>
 
 [CmdletBinding(DefaultParameterSetName='Default')]
@@ -72,33 +72,6 @@ param(
   [int]$CacheMaxAgeDays = 21
 )
 
-# --- HTTP with retry + jitter (exponential backoff) ---
-function Invoke-HttpWithRetry {
-  param(
-    [Parameter(Mandatory)][string]$Uri,
-    [int]$MaxAttempts = 4,
-    [int]$BaseDelayMs = 300
-  )
-  $attempt = 0
-  while ($true) {
-    $attempt++
-    try {
-      return Invoke-WebRequest -Uri $Uri -Headers @{
-        'User-Agent'      = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) PowerShell scraper'
-        'Accept-Language' = 'en-US,en;q=0.9'
-      } -ErrorAction Stop
-    } catch {
-      if ($attempt -ge $MaxAttempts) { throw }
-      $pow = [Math]::Pow(2, ($attempt - 1))
-      $jitter = Get-Random -Minimum 50 -Maximum 250
-      $delay = [int]($BaseDelayMs * $pow + $jitter)
-      Write-Warning ("HTTP attempt {0}/{1} failed for {2}: {3}. Retrying in {4} ms..." -f $attempt, $MaxAttempts, $Uri, $_.Exception.Message, $delay)
-      Start-Sleep -Milliseconds $delay
-    }
-  }
-}
-function Invoke-Http { param([Parameter(Mandatory)][string]$Uri) Invoke-HttpWithRetry -Uri $Uri }
-
 function Remove-Html {
   param([string]$Html)
   if ([string]::IsNullOrWhiteSpace($Html)) { return $null }
@@ -141,6 +114,14 @@ function Get-FirstYearFromText {
   if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
   $m = [regex]::Match($Text, '\b(19|20)\d{2}\b')
   if ($m.Success) { [int]$m.Value } else { $null }
+}
+
+function Invoke-Http {
+  param([Parameter(Mandatory)] [string]$Uri)
+  Invoke-WebRequest -Uri $Uri -Headers @{
+    'User-Agent'      = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) PowerShell scraper'
+    'Accept-Language' = 'en-US,en;q=0.9'
+  } -ErrorAction Stop
 }
 
 # Determine Network/Service from URL title
@@ -304,10 +285,9 @@ function Get-ImdbRating {
 function Get-ImdbAssessment {
   <#
     Returns:
-      @{ Status='ok'; Id='tt…'; Rating=[double]; Votes=[int]; Qid=[string|null] }
+      @{ Status='ok'; Id='tt…'; Rating=[double]; Votes=[int] }
       @{ Status='not_found' } / @{ Status='error' }
     Tries: IMDb suggestion → IMDb find → Wikidata P345 → Wikipedia ext. link → web search
-    Better title disambiguation: prefer TV entries; down-rank "(film)"; consider year closeness; use NetworkHint.
   #>
   param(
     [Parameter(Mandatory)] [string]$Title,
@@ -317,48 +297,29 @@ function Get-ImdbAssessment {
     [string]$NetworkHint
   )
 
-  # Pre-get QID from enwiki when possible (helps cache + output)
-  $qid = $null
-  try {
-    if ($TitleHref) {
-      $pageTitle = Get-WikiTitleFromHref $TitleHref
-      if ($pageTitle) { $qid = Get-WikidataQidFromEnwikiTitle -EnwikiTitle $pageTitle -DelayMs $DelayMs }
-    }
-    if (-not $qid) {
-      $qid = Get-WikidataQidFromEnwikiTitle -EnwikiTitle $Title -DelayMs $DelayMs
-    }
-  } catch {}
-
   try {
     foreach ($queryTitle in @($Title, (Clean-TitleForSearch $Title))) {
       if ([string]::IsNullOrWhiteSpace($queryTitle)) { continue }
       try {
         $firstLetter = ($queryTitle.Trim())[0].ToString().ToLower()
         $sugUrl = "https://v2.sg.media-imdb.com/suggestion/$firstLetter/" + [System.Uri]::EscapeDataString($queryTitle) + ".json"
-        Start-Sleep -Milliseconds $DelayMs
         $sugResp = Invoke-Http -Uri $sugUrl
         $json = $sugResp.Content | ConvertFrom-Json
         if ($json -and $json.d) {
           $scored = foreach ($d in $json.d) {
             if (-not ($d.id -match '^tt\d+')) { continue }
-            # score heuristics
             $score = 0
-            if ($d.l -eq $queryTitle) { $score += 2 }                            # exact title
-            if ($PremiereYear -and $d.y -eq $PremiereYear) { $score += 3 }       # exact year
-            elseif ($PremiereYear -and $d.y -and [math]::Abs($d.y - $PremiereYear) -le 1) { $score += 1 } # near year
-            if ($d.q -match '(?i)TV|Series|Mini') { $score += 2 }                # TV leaning
-            if ($d.q -match '(?i)film') { $score -= 2 }                          # down-rank films
-            if ($NetworkHint -and $d.s -and ($d.s -match [regex]::Escape($NetworkHint))) { $score += 1 } # hint in summary
-            [pscustomobject]@{ Id = $d.id; Score = $score }
+            if ($d.l -eq $queryTitle) { $score += 2 }
+            if ($PremiereYear -and $d.y -eq $PremiereYear) { $score += 3 }
+            elseif ($PremiereYear -and $d.yr -and ($d.yr -match [regex]::Escape("$PremiereYear"))) { $score += 2 }
+            if ($d.q -match '(?i)TV') { $score += 1 }
+            if ($NetworkHint -and $d.s -and ($d.s -match [regex]::Escape($NetworkHint))) { $score += 1 }
+            if ($d.q -match '(?i)film') { $score -= 2 }
+            [pscustomobject]@{ Id=$d.id; Score=$score }
           }
           if ($scored) {
             $ttId = ($scored | Sort-Object Score -Descending | Select-Object -First 1).Id
-            if ($ttId) {
-              Start-Sleep -Milliseconds $DelayMs
-              $r = Get-ImdbRating -ImdbId $ttId
-              if ($r -and $r.Status -eq 'ok') { $r['Qid'] = $qid }
-              return $r
-            }
+            if ($ttId) { Start-Sleep -Milliseconds $DelayMs; return Get-ImdbRating -ImdbId $ttId }
           }
         }
       } catch { }
@@ -366,53 +327,39 @@ function Get-ImdbAssessment {
 
     try {
       $findUrl = "https://www.imdb.com/find/?s=tt&q=" + [System.Uri]::EscapeDataString($Title)
-      Start-Sleep -Milliseconds $DelayMs
       $findResp = Invoke-Http -Uri $findUrl
       $m = [regex]::Match($findResp.Content, '/title/(tt\d+)/')
       if ($m.Success) {
         $ttId = $m.Groups[1].Value
         Start-Sleep -Milliseconds $DelayMs
-        $r = Get-ImdbRating -ImdbId $ttId
-        if ($r -and $r.Status -eq 'ok') { $r['Qid'] = $qid }
-        return $r
+        return Get-ImdbRating -ImdbId $ttId
       }
     } catch { }
 
+    $qid = $null
+    if ($TitleHref) {
+      $pageTitle = Get-WikiTitleFromHref $TitleHref
+      if ($pageTitle) { $qid = Get-WikidataQidFromEnwikiTitle -EnwikiTitle $pageTitle -DelayMs $DelayMs }
+    }
     if (-not $qid) {
-      # try again via enwiki (Title)
       $qid = Get-WikidataQidFromEnwikiTitle -EnwikiTitle $Title -DelayMs $DelayMs
     }
     if ($qid) {
       $tt2 = Get-ImdbIdFromWikidataQid -Qid $qid -DelayMs $DelayMs
-      if ($tt2) {
-        Start-Sleep -Milliseconds $DelayMs
-        $r = Get-ImdbRating -ImdbId $tt2
-        if ($r -and $r.Status -eq 'ok') { $r['Qid'] = $qid }
-        return $r
-      }
+      if ($tt2) { Start-Sleep -Milliseconds $DelayMs; return Get-ImdbRating -ImdbId $tt2 }
     }
 
     if ($TitleHref) {
       $tt3 = Try-GetImdbIdFromWikipediaPage -WikiHref $TitleHref -DelayMs $DelayMs
-      if ($tt3) {
-        Start-Sleep -Milliseconds $DelayMs
-        $r = Get-ImdbRating -ImdbId $tt3
-        if ($r -and $r.Status -eq 'ok') { $r['Qid'] = $qid }
-        return $r
-      }
+      if ($tt3) { Start-Sleep -Milliseconds $DelayMs; return Get-ImdbRating -ImdbId $tt3 }
     }
 
     $tt4 = Try-GetImdbIdFromWebSearch -Title $Title -PremiereYear $PremiereYear -DelayMs $DelayMs -NetworkHint $NetworkHint
-    if ($tt4) {
-      Start-Sleep -Milliseconds $DelayMs
-      $r = Get-ImdbRating -ImdbId $tt4
-      if ($r -and $r.Status -eq 'ok') { $r['Qid'] = $qid }
-      return $r
-    }
+    if ($tt4) { Start-Sleep -Milliseconds $DelayMs; return Get-ImdbRating -ImdbId $tt4 }
 
-    return @{ Status='not_found'; Qid=$qid }
+    return @{ Status='not_found' }
   } catch {
-    return @{ Status='error'; Qid=$qid }
+    return @{ Status='error' }
   }
 }
 
@@ -447,34 +394,22 @@ function Get-PremiereDate {
 function Resolve-MonthNumber {
   param([Parameter(Mandatory)][string]$Month)
   $m = $Month.Trim()
-
-  # Numeric: "7" or "07"
   $n = 0
-  if ([int]::TryParse($m, [ref]$n)) {
-    if ($n -ge 1 -and $n -le 12) { return $n } else { return $null }
-  }
-
-  # Names: "July", "Jul" (case-insensitive)
+  if ([int]::TryParse($m, [ref]$n)) { if ($n -ge 1 -and $n -le 12) { return $n } else { return $null } }
   $culture = [System.Globalization.CultureInfo]::GetCultureInfo('en-US')
   $title   = $culture.TextInfo.ToTitleCase($m.ToLowerInvariant())
-
   foreach ($fmt in 'MMMM','MMM') {
-    try {
-      $dt = [datetime]::ParseExact($title, $fmt, $culture)
-      return $dt.Month
-    } catch { }
+    try { $dt = [datetime]::ParseExact($title, $fmt, $culture); return $dt.Month } catch { }
   }
-
   return $null
 }
 
 # --- Dedup & shape helpers ---
 function Select-OutputShape {
   param([Parameter(Mandatory)][object[]]$Rows)
-  if (-not $Rows) { return @() }
-  $rowsArr = @($Rows)
-  if ($rowsArr.Count -eq 0) { return @() }
-  $rowsArr | Select-Object Title, Genre, Premiere, Network, ImdbRating, ImdbVotes, ImdbId, WikidataQid
+  $Rows | Select-Object `
+    Title, Genre, Premiere, Network, ImdbRating, ImdbVotes, ImdbId, WikidataQid, `
+    ChangeType, SeenThisRun, FirstSeen, LastSeen, PrevImdbRating, PrevImdbVotes, DeltaRating, DeltaVotes
 }
 
 function Get-IdentityKey {
@@ -605,7 +540,6 @@ function To-AssessmentFromCache {
     Id     = $Entry.Id
     Rating = $Entry.Rating
     Votes  = $Entry.Votes
-    Qid    = $Entry.Qid
   }
 }
 
@@ -613,14 +547,15 @@ function Update-PersistentCacheEntry {
   param(
     [Parameter(Mandatory)][hashtable]$Cache,
     [Parameter(Mandatory)][string]$Key,
-    [Parameter(Mandatory)][hashtable]$Assessment
+    [Parameter(Mandatory)][hashtable]$Assessment,
+    [string]$Qid
   )
   $Cache[$Key] = [pscustomobject]@{
     Status   = $Assessment.Status
     Id       = $Assessment.Id
     Rating   = $Assessment.Rating
     Votes    = $Assessment.Votes
-    Qid      = $Assessment.Qid
+    Qid      = $Qid
     CachedAt = (Get-Date).ToUniversalTime().ToString('o')
   }
 }
@@ -660,10 +595,6 @@ function Get-DeltaReport {
     [Parameter(Mandatory)][object[]]$Existing,
     [Parameter(Mandatory)][object[]]$New
   )
-
-  $Existing = @($Existing)
-  $New      = @($New)
-
   $mapOld = @{}
   foreach ($r in $Existing) { if ($r) { $k = Get-IdentityKey -Row $r; if ($k) { $mapOld[$k] = $r } } }
 
@@ -832,7 +763,19 @@ foreach ($Url in $Urls) {
         if (-not ($hasYear -and $hasMonthOrDate)) { continue }
       }
 
-      # --- IMDb lookup with persistent cache + Qid support ---
+      # Collect Wikidata QID (if available quickly)
+      $wikidataQid = $null
+      try {
+        if ($titleHref) {
+          $pageTitle = Get-WikiTitleFromHref $titleHref
+          if ($pageTitle) { $wikidataQid = Get-WikidataQidFromEnwikiTitle -EnwikiTitle $pageTitle -DelayMs $RequestDelayMs }
+        }
+        if (-not $wikidataQid) {
+          $wikidataQid = Get-WikidataQidFromEnwikiTitle -EnwikiTitle $title -DelayMs $RequestDelayMs
+        }
+      } catch { $wikidataQid = $null }
+
+      # IMDb lookup with persistent cache
       $premYear = if ($premDate) { $premDate.Year } else { Get-FirstYearFromText $premiere }
       $imdbKey  = "{0}|{1}" -f $networkName, $title
 
@@ -850,7 +793,7 @@ foreach ($Url in $Urls) {
           $assess = Get-ImdbAssessment -Title $title -PremiereYear $premYear -DelayMs $RequestDelayMs -TitleHref $titleHref -NetworkHint $networkName
           $imdbCache[$imdbKey] = $assess
           if ($usePersistentCache) {
-            Update-PersistentCacheEntry -Cache $persistCache -Key $imdbKey -Assessment $assess
+            Update-PersistentCacheEntry -Cache $persistCache -Key $imdbKey -Assessment $assess -Qid $wikidataQid
             $cacheDirty = $true
           }
         }
@@ -869,7 +812,7 @@ foreach ($Url in $Urls) {
             ImdbRating  = [math]::Round($assessment.Rating, 1)
             ImdbVotes   = $assessment.Votes
             ImdbId      = $assessment.Id
-            WikidataQid = $assessment.Qid
+            WikidataQid = $wikidataQid
           }) | Out-Null
         }
       }
@@ -883,7 +826,7 @@ foreach ($Url in $Urls) {
           ImdbRating  = $label
           ImdbVotes   = $null
           ImdbId      = $null
-          WikidataQid = $assessment.Qid
+          WikidataQid = $wikidataQid
         }) | Out-Null
       }
     }
@@ -900,17 +843,13 @@ $dedupNew
 
 # Read existing (for delta + merge)
 $existing = @()
-if (Test-Path $OutputCsv) {
+if ($OutputCsv -and (Test-Path $OutputCsv)) {
   try   { $existing = @((Import-Csv $OutputCsv)) }
   catch { Write-Warning ("Failed to read existing CSV '{0}': {1}" -f $OutputCsv, $_.Exception.Message) }
 }
 $shapeExisting = if ($existing -and $existing.Count -gt 0) { Select-OutputShape -Rows $existing } else { @() }
 
-# Ensure arrays before delta (fixes null binding)
-$shapeExisting = @($shapeExisting)
-$dedupNew      = @($dedupNew)
-
-# Delta tracking
+# Delta tracking summary
 $delta = Get-DeltaReport -Existing $shapeExisting -New $dedupNew
 $addedCount   = ($delta.Added   | Measure-Object).Count
 $updatedCount = ($delta.Updated | Measure-Object).Count
@@ -928,28 +867,121 @@ if ($DeltaJsonPath) {
   }
 }
 
-# Merge + strong sort + write CSV
+# --- Merge with delta columns, strong sort, write CSV ---
 if ($OutputCsv) {
   $dir = Split-Path -Parent $OutputCsv
   if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
 
-  $map = @{}
-  foreach ($r in $shapeExisting) { if ($r) { $k = Get-IdentityKey -Row $r; if ($k) { $map[$k] = $r } } }
-  foreach ($r in $dedupNew)     { if ($r) { $k = Get-IdentityKey -Row $r; if ($k) { $map[$k] = $r } } }
+  # Build maps
+  $mapOld = @{}
+  foreach ($r in $shapeExisting) { if ($r) { $k = Get-IdentityKey -Row $r; if ($k) { $mapOld[$k] = $r } } }
 
-  $merged    = @($map.Values)
+  $mapNew = @{}
+  foreach ($r in $dedupNew)     { if ($r) { $k = Get-IdentityKey -Row $r; if ($k) { $mapNew[$k] = $r } } }
+
+  $nowIso = (Get-Date).ToUniversalTime().ToString('o')
+  $unionKeys = New-Object System.Collections.Generic.HashSet[string]
+  foreach ($k in $mapOld.Keys) { [void]$unionKeys.Add($k) }
+  foreach ($k in $mapNew.Keys) { [void]$unionKeys.Add($k) }
+
+  $mergedList = New-Object System.Collections.Generic.List[object]
+
+  foreach ($k in $unionKeys) {
+    $old = if ($mapOld.ContainsKey($k)) { $mapOld[$k] } else { $null }
+    $new = if ($mapNew.ContainsKey($k)) { $mapNew[$k] } else { $null }
+
+    if ($new) {
+      # Start from new (current scrape)
+      $row = [pscustomobject]@{
+        Title       = $new.Title
+        Genre       = $new.Genre
+        Premiere    = $new.Premiere
+        Network     = $new.Network
+        ImdbRating  = $new.ImdbRating
+        ImdbVotes   = $new.ImdbVotes
+        ImdbId      = $new.ImdbId
+        WikidataQid = $new.WikidataQid
+        # delta columns (filled below)
+        ChangeType     = $null
+        SeenThisRun    = 'Yes'
+        FirstSeen      = $null
+        LastSeen       = $nowIso
+        PrevImdbRating = $null
+        PrevImdbVotes  = $null
+        DeltaRating    = $null
+        DeltaVotes     = $null
+      }
+
+      # FirstSeen
+      if ($old -and $old.FirstSeen) { $row.FirstSeen = $old.FirstSeen } else { $row.FirstSeen = $nowIso }
+
+      # Prev / Delta
+      if ($old) {
+        $row.PrevImdbRating = $old.ImdbRating
+        $row.PrevImdbVotes  = $old.ImdbVotes
+
+        $od=[double]::NaN; $nd=[double]::NaN
+        if ([double]::TryParse($old.ImdbRating, [ref]$od) -and [double]::TryParse($new.ImdbRating, [ref]$nd)) {
+          $row.DeltaRating = [math]::Round(($nd - $od), 1)
+        }
+        $oi=[int]::MinValue; $ni=[int]::MinValue
+        if ([int]::TryParse($old.ImdbVotes, [ref]$oi) -and [int]::TryParse($new.ImdbVotes, [ref]$ni)) {
+          $row.DeltaVotes = ($ni - $oi)
+        }
+      }
+
+      # ChangeType
+      if (-not $old) {
+        $row.ChangeType = 'Added'
+      } else {
+        $diff = Compare-RowFields -Old $old -New $new
+        $row.ChangeType = if ($diff.Count -gt 0) { 'Updated' } else { 'Unchanged' }
+      }
+
+      $mergedList.Add($row) | Out-Null
+    }
+    else {
+      # Not seen this run: keep old and mark Stale
+      $row = [pscustomobject]@{
+        Title       = $old.Title
+        Genre       = $old.Genre
+        Premiere    = $old.Premiere
+        Network     = $old.Network
+        ImdbRating  = $old.ImdbRating
+        ImdbVotes   = $old.ImdbVotes
+        ImdbId      = $old.ImdbId
+        WikidataQid = $old.WikidataQid
+        ChangeType     = 'Stale'
+        SeenThisRun    = 'No'
+        FirstSeen      = $old.FirstSeen
+        LastSeen       = $old.LastSeen
+        PrevImdbRating = $old.PrevImdbRating
+        PrevImdbVotes  = $old.PrevImdbVotes
+        DeltaRating    = $old.DeltaRating
+        DeltaVotes     = $old.DeltaVotes
+      }
+      $mergedList.Add($row) | Out-Null
+    }
+  }
+
+  # Strong sort and write
+  $merged    = $mergedList.ToArray()
   $sortedAll = if ($merged.Count -gt 0) { Sort-ByOutputOrder -Rows $merged } else { @() }
 
   if ($sortedAll.Count -gt 0) {
     $sortedAll | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $OutputCsv
   } else {
     if (-not (Test-Path $OutputCsv)) {
-      "" | Select-Object @{n='Title';e={}}, @{n='Genre';e={}}, @{n='Premiere';e={}}, @{n='Network';e={}}, @{n='ImdbRating';e={}}, @{n='ImdbVotes';e={}}, @{n='ImdbId';e={}}, @{n='WikidataQid';e={}} |
+      "" | Select-Object `
+        @{n='Title';e={}}, @{n='Genre';e={}}, @{n='Premiere';e={}}, @{n='Network';e={}},
+        @{n='ImdbRating';e={}}, @{n='ImdbVotes';e={}}, @{n='ImdbId';e={}}, @{n='WikidataQid';e={}},
+        @{n='ChangeType';e={}}, @{n='SeenThisRun';e={}}, @{n='FirstSeen';e={}}, @{n='LastSeen';e={}},
+        @{n='PrevImdbRating';e={}}, @{n='PrevImdbVotes';e={}}, @{n='DeltaRating';e={}}, @{n='DeltaVotes';e={}} |
         Export-Csv -NoTypeInformation -Encoding UTF8 -Path $OutputCsv
     }
   }
 
-  Write-Host ("Merged {0} existing + {1} new → wrote {2} total row(s); fully resorted by rating DESC, votes DESC, premiere ASC, title ASC." -f $shapeExisting.Count, $dedupNew.Count, $sortedAll.Count)
+  Write-Host ("Merged {0} existing + {1} new → wrote {2} total row(s); resorted by rating DESC, votes DESC, premiere ASC, title ASC." -f $shapeExisting.Count, $dedupNew.Count, $sortedAll.Count)
 }
 
 # Save persistent cache if changed
