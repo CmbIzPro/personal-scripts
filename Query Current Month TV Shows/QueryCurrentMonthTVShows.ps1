@@ -2,7 +2,11 @@
 .SYNOPSIS
   Combined scraper for “List of <Service> original programming” Wikipedia pages.
 
-  - Works with multiple URLs (Netflix + HBO + HBO Max + Apple TV+ + others)
+  - URL list comes from a CSV file (REQUIRED): pass -ConfigCsv .\networks.csv
+        • Minimal shape:      Url
+                              https://en.wikipedia.org/wiki/List_of_...
+        • Optional columns:   Enabled (true/false) — rows with false/0/no are skipped
+        • Column name is case-insensitive; aliases accepted: Url, URL, Link, Href
   - Skips rows in "Upcoming" section(s)
   - Default filter: Premiere is in the target Year AND includes a month/day (not year-only)
   - Optional filter A (relative window): -OnlyTwoMonthsAgoMonth limits to the entire month from two months ago
@@ -26,22 +30,10 @@
 
 [CmdletBinding(DefaultParameterSetName='Default')]
 param(
-  [string[]]$Urls = @(
-    'https://en.wikipedia.org/wiki/List_of_Netflix_original_programming',
-    'https://en.wikipedia.org/wiki/List_of_HBO_original_programming#Upcoming_programming',
-    'https://en.wikipedia.org/wiki/List_of_HBO_Max_original_programming',
-    'https://en.wikipedia.org/wiki/List_of_Apple_TV%2B_original_programming',
-    'https://en.wikipedia.org/wiki/List_of_Paramount%2B_original_programming',
-    'https://en.wikipedia.org/wiki/List_of_Disney%2B_original_programming',
-    'https://en.wikipedia.org/wiki/List_of_Hulu_original_programming',
-    'https://en.wikipedia.org/wiki/List_of_Peacock_original_programming',
-    'https://en.wikipedia.org/wiki/List_of_Amazon_Prime_Video_original_programming',
-    'https://en.wikipedia.org/wiki/List_of_MGM%2B_original_programming',
-    'https://en.wikipedia.org/wiki/List_of_Discovery%2B_original_programming',
-    'https://en.wikipedia.org/wiki/List_of_Starz_original_programming',
-    'https://en.wikipedia.org/wiki/List_of_programs_broadcast_by_FX',
-    'https://en.wikipedia.org/wiki/List_of_programs_broadcast_by_AMC'
-  ),
+  # --- REQUIRED: CSV file containing the list of Wikipedia URLs ---
+  [Parameter(Mandatory=$true)]
+  [ValidateNotNullOrEmpty()]
+  [string]$ConfigCsv,
 
   # --- Output options ---
   [string]$OutputCsv = "C:\Personal Scripts\CurrentMonthTVShows.csv",
@@ -733,6 +725,72 @@ function Should-KeepByGenre {
 }
 # -------------------------------------------------------------
 
+# -------------------- Load URLs from CSV (REQUIRED) --------------------
+function Load-UrlsFromCsv {
+  param([Parameter(Mandatory)][string]$Path)
+
+  if (-not (Test-Path -LiteralPath $Path)) {
+    throw "Config CSV file not found: $Path"
+  }
+
+  # Try regular CSV with headers
+  try {
+    $rows = Import-Csv -LiteralPath $Path -ErrorAction Stop
+  } catch {
+    # Fallback: treat as simple one-column list (headerless)
+    $lines = Get-Content -LiteralPath $Path -Encoding UTF8
+    $urls  = New-Object System.Collections.Generic.List[string]
+    foreach ($ln in $lines) {
+      $t = "$ln".Trim()
+      if ($t -eq '' -or $t -match '^\s*#') { continue }
+      # Take first comma-separated value if present
+      $urls.Add(($t -split ',')[0].Trim()) | Out-Null
+    }
+    $uniq = @{}
+    foreach ($u in $urls) { if ($u) { $uniq[$u] = $true } }
+    $arr = @($uniq.Keys)
+    if ($arr.Count -eq 0) { throw "No URLs found in CSV '$Path'." }
+    Write-Host ("[Config] Loaded {0} URL(s) from {1}" -f $arr.Count, $Path)
+    return $arr
+  }
+
+  if ($rows.Count -eq 0) { throw "CSV '$Path' is empty." }
+
+  # Find a Url-like column
+  $props = $rows[0].PSObject.Properties.Name
+  $urlCol = $props | Where-Object { $_ -match '^(?i)(urls?|link|href)$' } | Select-Object -First 1
+  if (-not $urlCol) {
+    # If there's only one column, assume it's the URL column
+    if ($props.Count -eq 1) { $urlCol = $props[0] }
+    else { throw "CSV '$Path' must include a 'Url' column (aliases: Url, URL, Link, Href)." }
+  }
+
+  $list = New-Object System.Collections.Generic.List[string]
+  foreach ($row in $rows) {
+    # Honor optional Enabled column
+    $enabled = $true
+    if ($row.PSObject.Properties.Match('Enabled').Count -gt 0) {
+      $val = "$($row.Enabled)".Trim().ToLowerInvariant()
+      if ($val -in @('0','false','no','off','disabled')) { $enabled = $false }
+    }
+    if (-not $enabled) { continue }
+
+    $u = "$($row.$urlCol)".Trim()
+    if ($u) { $list.Add($u) | Out-Null }
+  }
+
+  $distinct = @{}
+  foreach ($u in $list) { $distinct[$u] = $true }
+  $urls = @($distinct.Keys)
+  if ($urls.Count -eq 0) { throw "No URLs found in CSV '$Path'." }
+  Write-Host ("[Config] Loaded {0} URL(s) from {1}" -f $urls.Count, $Path)
+  return $urls
+}
+# -----------------------------------------------------------------------
+
+# --- Resolve URL list from CSV (mandatory) ---
+$Urls = Load-UrlsFromCsv -Path $ConfigCsv
+
 # --- Main scrape across one or more URLs ---
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
 
@@ -1095,9 +1153,9 @@ $AssessSB = {
   }
 }
 
-# *************** FIX: stringify the assessor block for -Parallel ***************
+# *************** Stringify the assessor block for -Parallel (PS7-safe) ***************
 $AssessSbString = $AssessSB.ToString()
-# ********************************************************************************
+# *************************************************************************************
 
 if ($pending.Count -gt 0) {
   $parOut = @()
@@ -1333,7 +1391,7 @@ if ($OutputCsv -or $OutputJson -or $OutputExcel) {
     }
   }
 
-  # --- JSON (new) ---
+  # --- JSON (optional) ---
   if ($OutputJson.IsPresent) {
     $jsonPath = if ($OutputJsonPath) { $OutputJsonPath } else { Get-DerivedPath -BasePath $OutputCsv -NewExtension '.json' }
     Ensure-Dir $jsonPath
@@ -1349,7 +1407,7 @@ if ($OutputCsv -or $OutputJson -or $OutputExcel) {
     }
   }
 
-  # --- Excel (new; requires ImportExcel) ---
+  # --- Excel (optional; requires ImportExcel) ---
   if ($OutputExcel.IsPresent) {
     $xlsxPath = if ($OutputExcelPath) { $OutputExcelPath } else { Get-DerivedPath -BasePath $OutputCsv -NewExtension '.xlsx' }
     Ensure-Dir $xlsxPath
@@ -1370,7 +1428,6 @@ if ($OutputCsv -or $OutputJson -or $OutputExcel) {
         if ($sortedAll.Count -gt 0) {
           $sortedAll | Export-Excel -Path $xlsxPath -WorksheetName 'Shows' -TableName 'Shows' -AutoSize -FreezeTopRow -BoldTopRow -ClearSheet
         } else {
-          # Create a sheet with headers (one blank row)
           "" | Select-Object `
             @{n='Title';e={}}, @{n='Genre';e={}}, @{n='Premiere';e={}}, @{n='Network';e={}},
             @{n='ImdbRating';e={}}, @{n='ImdbVotes';e={}}, @{n='ImdbId';e={}}, @{n='WikidataQid';e={}},
