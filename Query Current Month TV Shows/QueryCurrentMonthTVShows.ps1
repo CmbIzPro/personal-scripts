@@ -16,8 +16,9 @@
   - Persistent IMDb cache (DEFAULT ON): disk-backed JSON cache; disable with -NoPersistentCache
   - Delta columns in CSV/JSON/Excel: ChangeType, SeenThisRun, FirstSeen, LastSeen,
                                      PrevImdbRating, PrevImdbVotes, DeltaRating, DeltaVotes.
-  - Parallel IMDb lookups (DEFAULT if PS7+): throttled ForEach-Object -Parallel.
-  - Flexible export formats: CSV (default), plus optional -OutputJson and/or -OutputExcel (ImportExcel)
+  - Parallel IMDb lookups (DEFAULT if PS7+): throttled ForEach-Object -Parallel (PS7-safe).
+  - Flexible export formats: CSV (default), plus optional -OutputJson and/or -OutputExcel (ImportExcel).
+  - Genre/type filters: -IncludeGenre 'Drama','Documentary' and/or -ExcludeGenre 'Reality' (fuzzy/diacritics-insensitive).
 
 .OUTPUT
   Title, Genre, Premiere, Network, ImdbRating, ImdbVotes, ImdbId, WikidataQid, and delta columns
@@ -48,6 +49,10 @@ param(
   [string]$OutputJsonPath,
   [switch]$OutputExcel,
   [string]$OutputExcelPath,
+
+  # --- Genre/type filters ---
+  [string[]]$IncludeGenre,
+  [string[]]$ExcludeGenre,
 
   # --- Filters / thresholds ---
   [int]$Year = 2025,
@@ -629,6 +634,105 @@ function Get-DeltaReport {
   [pscustomobject]@{ Added=$added.ToArray(); Updated=$updated.ToArray(); Removed=$removed.ToArray() }
 }
 
+# -------------------- Genre filter helpers --------------------
+function Normalize-TextSimple {
+  param([string]$s)
+  if ([string]::IsNullOrWhiteSpace($s)) { return '' }
+  $t = Remove-Diacritics $s
+  $t = $t.ToLowerInvariant()
+  $t = ($t -replace '[^a-z0-9]+',' ').Trim()
+  $t -replace '\s{2,}',' '
+}
+
+function Parse-Genres {
+  <#
+    Splits a wiki “Genre” cell into tokens (without changing the original value used for output).
+    Handles separators like commas, slashes, semicolons, pipes, bullets, en/em dashes, ampersand, and “and”.
+  #>
+  param([string]$GenreText)
+  if ([string]::IsNullOrWhiteSpace($GenreText)) { return @() }
+  $parts = $GenreText -split '(?i)[,\/;|•·–—&]|(?:\band\b)'
+  $parts | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+}
+
+function Expand-GenreTokens {
+  <#
+    Adds light-weight synonyms so common asks behave as expected:
+      - docuseries → documentary
+      - docudrama  → documentary, drama
+      - unscripted → reality
+      - anime/animated → animation
+      - sitcom/stand up → comedy
+  #>
+  param([string[]]$Tokens)
+  $expanded = New-Object System.Collections.Generic.HashSet[string]
+  foreach ($tok in $Tokens) {
+    $n = Normalize-TextSimple $tok
+    if (-not [string]::IsNullOrWhiteSpace($n)) {
+      [void]$expanded.Add($n)
+      if ($n -match '\bdocuseries?\b') { [void]$expanded.Add('documentary') }
+      if ($n -match '\bdocudrama\b')   { [void]$expanded.Add('documentary'); [void]$expanded.Add('drama') }
+      if ($n -match '\bunscripted\b')  { [void]$expanded.Add('reality') }
+      if ($n -match '\banime\b')       { [void]$expanded.Add('animation') }
+      if ($n -match '\banimated\b')    { [void]$expanded.Add('animation') }
+      if ($n -match '\bsitcom\b')      { [void]$expanded.Add('comedy') }
+      if ($n -match '\bstand up\b')    { [void]$expanded.Add('comedy') }
+    }
+  }
+  return $expanded.ToArray()
+}
+
+function Should-KeepByGenre {
+  <#
+    Returns $true if the row should be kept given Include/Exclude lists.
+
+    - If IncludeGenre is provided, at least one token must match.
+    - If ExcludeGenre is provided, any match will exclude the row.
+    - Matching is case/diacritic-insensitive with substring tolerance
+      and a few synonyms via Expand-GenreTokens.
+  #>
+  param(
+    [string]$GenreText,
+    [string[]]$Include,
+    [string[]]$Exclude
+  )
+  # Prepare row tokens
+  $rowTokensRaw = Parse-Genres $GenreText
+  $rowTokens    = Expand-GenreTokens $rowTokensRaw
+
+  # Normalize include/exclude
+  $inc = @(); if ($Include) { $inc = $Include | ForEach-Object { Normalize-TextSimple $_ } | Where-Object { $_ } }
+  $exc = @(); if ($Exclude) { $exc = $Exclude | ForEach-Object { Normalize-TextSimple $_ } | Where-Object { $_ } }
+
+  if (($inc.Count -eq 0) -and ($exc.Count -eq 0)) { return $true }
+
+  # Include check: require at least one hit if include list present
+  $includeOk = $true
+  if ($inc.Count -gt 0) {
+    $includeOk = $false
+    foreach ($t in $rowTokens) {
+      foreach ($i in $inc) {
+        if ($t -like "*$i*" -or $i -like "*$t*" -or ($i -eq 'documentary' -and $t -like 'docu*')) { $includeOk = $true; break }
+      }
+      if ($includeOk) { break }
+    }
+  }
+
+  # Exclude check: drop on any hit
+  $excludeOk = $true
+  if ($exc.Count -gt 0) {
+    foreach ($t in $rowTokens) {
+      foreach ($e in $exc) {
+        if ($t -like "*$e*" -or $e -like "*$t*" -or ($e -eq 'documentary' -and $t -like 'docu*')) { $excludeOk = $false; break }
+      }
+      if (-not $excludeOk) { break }
+    }
+  }
+
+  return ($includeOk -and $excludeOk)
+}
+# -------------------------------------------------------------
+
 # --- Main scrape across one or more URLs ---
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
 
@@ -755,6 +859,13 @@ foreach ($Url in $Urls) {
       $genre    = $cells[$idxGenre]
       $premiere = $cells[$idxPremiere]
       if ([string]::IsNullOrWhiteSpace($title) -or [string]::IsNullOrWhiteSpace($premiere)) { continue }
+
+      # --- Genre filters (optional) ---
+      if ($IncludeGenre -or $ExcludeGenre) {
+        if (-not (Should-KeepByGenre -GenreText $genre -Include $IncludeGenre -Exclude $ExcludeGenre)) {
+          continue
+        }
+      }
 
       $titleHref = $null
       if ($idxTitle -lt $rawCells.Count) {
