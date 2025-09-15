@@ -14,9 +14,10 @@
   - DEFAULT WRITE BEHAVIOR: merge existing CSV + new rows, de-dupe, then strong sort
   - Delta tracking: Added / Updated / Removed-not-seen-this-run, optional JSON changelog
   - Persistent IMDb cache (DEFAULT ON): disk-backed JSON cache; disable with -NoPersistentCache
-  - Delta columns in CSV: ChangeType, SeenThisRun, FirstSeen, LastSeen,
-                          PrevImdbRating, PrevImdbVotes, DeltaRating, DeltaVotes.
+  - Delta columns in CSV/JSON/Excel: ChangeType, SeenThisRun, FirstSeen, LastSeen,
+                                     PrevImdbRating, PrevImdbVotes, DeltaRating, DeltaVotes.
   - Parallel IMDb lookups (DEFAULT if PS7+): throttled ForEach-Object -Parallel.
+  - Flexible export formats: CSV (default), plus optional -OutputJson and/or -OutputExcel (ImportExcel)
 
 .OUTPUT
   Title, Genre, Premiere, Network, ImdbRating, ImdbVotes, ImdbId, WikidataQid, and delta columns
@@ -40,7 +41,15 @@ param(
     'https://en.wikipedia.org/wiki/List_of_programs_broadcast_by_FX',
     'https://en.wikipedia.org/wiki/List_of_programs_broadcast_by_AMC'
   ),
+
+  # --- Output options ---
   [string]$OutputCsv = "C:\Personal Scripts\CurrentMonthTVShows.csv",
+  [switch]$OutputJson,
+  [string]$OutputJsonPath,
+  [switch]$OutputExcel,
+  [string]$OutputExcelPath,
+
+  # --- Filters / thresholds ---
   [int]$Year = 2025,
   [double]$MinRating = 8.4,
   [int]$MinVotes = 1000,
@@ -1086,12 +1095,28 @@ if ($DeltaJsonPath) {
   }
 }
 
-# --- Merge with delta columns, strong sort, write CSV ---
-if ($OutputCsv) {
-  $dir = Split-Path -Parent $OutputCsv
-  if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
+# Helper: derive new path from CSV path or PWD
+function Get-DerivedPath {
+  param([string]$BasePath,[string]$NewExtension)
+  if ($BasePath) {
+    $dir  = Split-Path -Parent $BasePath
+    $name = [IO.Path]::GetFileNameWithoutExtension($BasePath)
+    return (Join-Path $dir ($name + $NewExtension))
+  } else {
+    return (Join-Path $pwd ("CurrentMonthTVShows" + $NewExtension))
+  }
+}
 
-  # Build maps
+# --- Merge with delta columns, strong sort, write outputs ---
+if ($OutputCsv -or $OutputJson -or $OutputExcel) {
+  # Ensure output directories exist
+  function Ensure-Dir($path) {
+    if (-not $path) { return }
+    $dir = Split-Path -Parent $path
+    if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
+  }
+
+  # Build maps for merge
   $mapOld = @{}
   foreach ($r in $shapeExisting) { if ($r) { $k = Get-IdentityKey -Row $r; if ($k) { $mapOld[$k] = $r } } }
 
@@ -1180,16 +1205,72 @@ if ($OutputCsv) {
   $merged    = $mergedList.ToArray()
   $sortedAll = if ($merged.Count -gt 0) { Sort-ByOutputOrder -Rows $merged } else { @() }
 
-  if ($sortedAll.Count -gt 0) {
-    $sortedAll | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $OutputCsv
-  } else {
-    if (-not (Test-Path $OutputCsv)) {
-      "" | Select-Object `
-        @{n='Title';e={}}, @{n='Genre';e={}}, @{n='Premiere';e={}}, @{n='Network';e={}},
-        @{n='ImdbRating';e={}}, @{n='ImdbVotes';e={}}, @{n='ImdbId';e={}}, @{n='WikidataQid';e={}},
-        @{n='ChangeType';e={}}, @{n='SeenThisRun';e={}}, @{n='FirstSeen';e={}}, @{n='LastSeen';e={}},
-        @{n='PrevImdbRating';e={}}, @{n='PrevImdbVotes';e={}}, @{n='DeltaRating';e={}}, @{n='DeltaVotes';e={}} |
-        Export-Csv -NoTypeInformation -Encoding UTF8 -Path $OutputCsv
+  # --- CSV (existing behavior) ---
+  if ($OutputCsv) {
+    Ensure-Dir $OutputCsv
+    if ($sortedAll.Count -gt 0) {
+      $sortedAll | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $OutputCsv
+    } else {
+      if (-not (Test-Path $OutputCsv)) {
+        "" | Select-Object `
+          @{n='Title';e={}}, @{n='Genre';e={}}, @{n='Premiere';e={}}, @{n='Network';e={}},
+          @{n='ImdbRating';e={}}, @{n='ImdbVotes';e={}}, @{n='ImdbId';e={}}, @{n='WikidataQid';e={}},
+          @{n='ChangeType';e={}}, @{n='SeenThisRun';e={}}, @{n='FirstSeen';e={}}, @{n='LastSeen';e={}},
+          @{n='PrevImdbRating';e={}}, @{n='PrevImdbVotes';e={}}, @{n='DeltaRating';e={}}, @{n='DeltaVotes';e={}} |
+          Export-Csv -NoTypeInformation -Encoding UTF8 -Path $OutputCsv
+      }
+    }
+  }
+
+  # --- JSON (new) ---
+  if ($OutputJson.IsPresent) {
+    $jsonPath = if ($OutputJsonPath) { $OutputJsonPath } else { Get-DerivedPath -BasePath $OutputCsv -NewExtension '.json' }
+    Ensure-Dir $jsonPath
+    try {
+      if ($sortedAll.Count -gt 0) {
+        $sortedAll | ConvertTo-Json -Depth 6 | Out-File -FilePath $jsonPath -Encoding UTF8
+      } else {
+        '[]' | Out-File -FilePath $jsonPath -Encoding UTF8
+      }
+      Write-Host ("Wrote JSON to {0}" -f $jsonPath)
+    } catch {
+      Write-Warning ("Failed to write JSON '{0}': {1}" -f $jsonPath, $_.Exception.Message)
+    }
+  }
+
+  # --- Excel (new; requires ImportExcel) ---
+  if ($OutputExcel.IsPresent) {
+    $xlsxPath = if ($OutputExcelPath) { $OutputExcelPath } else { Get-DerivedPath -BasePath $OutputCsv -NewExtension '.xlsx' }
+    Ensure-Dir $xlsxPath
+    $importExcelAvailable = $false
+    try {
+      if (-not (Get-Module -ListAvailable -Name ImportExcel)) {
+        Import-Module ImportExcel -ErrorAction Stop
+      } else {
+        Import-Module ImportExcel -ErrorAction SilentlyContinue
+      }
+      $importExcelAvailable = $true
+    } catch {
+      Write-Warning "ImportExcel module not available. Install with: Install-Module ImportExcel -Scope CurrentUser"
+    }
+
+    if ($importExcelAvailable) {
+      try {
+        if ($sortedAll.Count -gt 0) {
+          $sortedAll | Export-Excel -Path $xlsxPath -WorksheetName 'Shows' -TableName 'Shows' -AutoSize -FreezeTopRow -BoldTopRow -ClearSheet
+        } else {
+          # Create a sheet with headers (one blank row)
+          "" | Select-Object `
+            @{n='Title';e={}}, @{n='Genre';e={}}, @{n='Premiere';e={}}, @{n='Network';e={}},
+            @{n='ImdbRating';e={}}, @{n='ImdbVotes';e={}}, @{n='ImdbId';e={}}, @{n='WikidataQid';e={}},
+            @{n='ChangeType';e={}}, @{n='SeenThisRun';e={}}, @{n='FirstSeen';e={}}, @{n='LastSeen';e={}},
+            @{n='PrevImdbRating';e={}}, @{n='PrevImdbVotes';e={}}, @{n='DeltaRating';e={}}, @{n='DeltaVotes';e={}} |
+            Export-Excel -Path $xlsxPath -WorksheetName 'Shows' -TableName 'Shows' -AutoSize -FreezeTopRow -BoldTopRow -ClearSheet
+        }
+        Write-Host ("Wrote Excel to {0}" -f $xlsxPath)
+      } catch {
+        Write-Warning ("Failed to write Excel '{0}': {1}" -f $xlsxPath, $_.Exception.Message)
+      }
     }
   }
 
