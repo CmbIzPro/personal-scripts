@@ -7,25 +7,19 @@
   - Default filter: Premiere is in the target Year AND includes a month/day (not year-only)
   - Optional filter A (relative window): -OnlyTwoMonthsAgoMonth limits to the entire month from two months ago
     (e.g., if current month is September, only July 1 – July 31)
-  - Optional filter B (explicit window): -FilterMonth <name|number> AND -FilterYear <yyyy> (both required together)
-    When used, the Year regex filter is ignored and only titles within that exact month are included.
+  - Optional filter B (explicit month & year)
   - IMDb: by default keeps only shows with Rating >= MinRating and Votes >= MinVotes
-          OR includes rows with lookup failures ("IMDb not found" / "IMDb lookup error")
+          OR includes rows with lookup failures
   - Adds Network column (auto from URL)
-  - DEFAULT WRITE BEHAVIOR: merges existing CSV + new rows, de-dups by identity key,
-    then sorts the ENTIRE file by:
-      1) IMDb rating (numeric) DESC
-      2) IMDb votes (numeric) DESC
-      3) Premiere date ASC
-      4) Title ASC
-  - Delta tracking: prints counts of Added / Updated / Removed-not-seen-this-run,
-    optional JSON changelog via -DeltaJsonPath.
-  - Persistent IMDb cache (DEFAULT ON): disk-backed JSON cache for IMDb lookups to reduce re-requests.
-    Disable with -NoPersistentCache. Control staleness with -CacheMaxAgeDays. Change file via -ImdbCachePath.
-  - Delta columns in CSV: ChangeType, SeenThisRun, FirstSeen, LastSeen, PrevImdbRating, PrevImdbVotes, DeltaRating, DeltaVotes.
+  - DEFAULT WRITE BEHAVIOR: merge existing CSV + new rows, de-dupe, then strong sort
+  - Delta tracking: Added / Updated / Removed-not-seen-this-run, optional JSON changelog
+  - Persistent IMDb cache (DEFAULT ON): disk-backed JSON cache; disable with -NoPersistentCache
+  - Delta columns in CSV: ChangeType, SeenThisRun, FirstSeen, LastSeen,
+                          PrevImdbRating, PrevImdbVotes, DeltaRating, DeltaVotes.
+  - Parallel IMDb lookups (DEFAULT if PS7+): throttled ForEach-Object -Parallel.
 
 .OUTPUT
-  Objects with Title, Genre, Premiere, Network, ImdbRating, ImdbVotes, ImdbId, WikidataQid, and delta columns
+  Title, Genre, Premiere, Network, ImdbRating, ImdbVotes, ImdbId, WikidataQid, and delta columns
 #>
 
 [CmdletBinding(DefaultParameterSetName='Default')]
@@ -69,7 +63,10 @@ param(
   # Persistent cache controls (DEFAULT ON)
   [switch]$NoPersistentCache,
   [string]$ImdbCachePath,
-  [int]$CacheMaxAgeDays = 21
+  [int]$CacheMaxAgeDays = 21,
+
+  # Parallel controls (DEFAULT on PS7+)
+  [int]$ParallelThrottle = 6
 )
 
 function Remove-Html {
@@ -284,9 +281,6 @@ function Get-ImdbRating {
 
 function Get-ImdbAssessment {
   <#
-    Returns:
-      @{ Status='ok'; Id='tt…'; Rating=[double]; Votes=[int] }
-      @{ Status='not_found' } / @{ Status='error' }
     Tries: IMDb suggestion → IMDb find → Wikidata P345 → Wikipedia ext. link → web search
   #>
   param(
@@ -592,9 +586,12 @@ function Compare-RowFields {
 
 function Get-DeltaReport {
   param(
-    [Parameter(Mandatory)][object[]]$Existing,
-    [Parameter(Mandatory)][object[]]$New
+    [object[]]$Existing,
+    [object[]]$New
   )
+  if (-not $Existing) { $Existing = @() }
+  if (-not $New)      { $New      = @() }
+
   $mapOld = @{}
   foreach ($r in $Existing) { if ($r) { $k = Get-IdentityKey -Row $r; if ($k) { $mapOld[$k] = $r } } }
 
@@ -667,6 +664,10 @@ if ($usePersistentCache) { $persistCache = Load-PersistentCache -Path $effective
 
 $imdbCache = @{}   # in-memory for this run (filled from persistent or fresh lookups)
 $results = New-Object System.Collections.Generic.List[object]
+
+# For parallel lookups: collect queue + context
+$pending = New-Object System.Collections.Generic.List[object]
+$ctxByKey = @{}
 
 foreach ($Url in $Urls) {
   try {
@@ -763,7 +764,7 @@ foreach ($Url in $Urls) {
         if (-not ($hasYear -and $hasMonthOrDate)) { continue }
       }
 
-      # Collect Wikidata QID (if available quickly)
+      # Collect Wikidata QID (quick try)
       $wikidataQid = $null
       try {
         if ($titleHref) {
@@ -775,58 +776,276 @@ foreach ($Url in $Urls) {
         }
       } catch { $wikidataQid = $null }
 
-      # IMDb lookup with persistent cache
+      # IMDb lookup with persistent cache → cache-first, else queue for parallel
       $premYear = if ($premDate) { $premDate.Year } else { Get-FirstYearFromText $premiere }
       $imdbKey  = "{0}|{1}" -f $networkName, $title
 
-      if (-not $imdbCache.ContainsKey($imdbKey)) {
-        $usedCache = $false
-        if ($usePersistentCache -and $persistCache.ContainsKey($imdbKey)) {
-          $entry = $persistCache[$imdbKey]
-          if (Is-CacheEntryFresh -Entry $entry -MaxAgeDays $CacheMaxAgeDays) {
-            $imdbCache[$imdbKey] = To-AssessmentFromCache -Entry $entry
-            $usedCache = $true
-          }
-        }
-
-        if (-not $usedCache) {
-          $assess = Get-ImdbAssessment -Title $title -PremiereYear $premYear -DelayMs $RequestDelayMs -TitleHref $titleHref -NetworkHint $networkName
-          $imdbCache[$imdbKey] = $assess
-          if ($usePersistentCache) {
-            Update-PersistentCacheEntry -Cache $persistCache -Key $imdbKey -Assessment $assess -Qid $wikidataQid
-            $cacheDirty = $true
-          }
+      $assessment = $null
+      $usedCache = $false
+      if ($usePersistentCache -and $persistCache.ContainsKey($imdbKey)) {
+        $entry = $persistCache[$imdbKey]
+        if (Is-CacheEntryFresh -Entry $entry -MaxAgeDays $CacheMaxAgeDays) {
+          $assessment = To-AssessmentFromCache -Entry $entry
+          $imdbCache[$imdbKey] = $assessment
+          $usedCache = $true
         }
       }
 
-      $assessment = $imdbCache[$imdbKey]
-
-      if ($assessment.Status -eq 'ok') {
-        $meets = ($assessment.Rating -ge $MinRating -and $assessment.Votes -ge $MinVotes)
-        if ($meets -or $IncludeBelowThreshold.IsPresent) {
+      if ($usedCache) {
+        if ($assessment.Status -eq 'ok') {
+          $meets = ($assessment.Rating -ge $MinRating -and $assessment.Votes -ge $MinVotes)
+          if ($meets -or $IncludeBelowThreshold.IsPresent) {
+            $results.Add([pscustomobject]@{
+              Title       = $title
+              Genre       = $genre
+              Premiere    = $premiere
+              Network     = $networkName
+              ImdbRating  = [math]::Round($assessment.Rating, 1)
+              ImdbVotes   = $assessment.Votes
+              ImdbId      = $assessment.Id
+              WikidataQid = $wikidataQid
+            }) | Out-Null
+          }
+        } else {
+          $label = if ($assessment.Status -eq 'not_found') { 'IMDb not found' } else { 'IMDb lookup error' }
           $results.Add([pscustomobject]@{
             Title       = $title
             Genre       = $genre
             Premiere    = $premiere
             Network     = $networkName
-            ImdbRating  = [math]::Round($assessment.Rating, 1)
-            ImdbVotes   = $assessment.Votes
-            ImdbId      = $assessment.Id
+            ImdbRating  = $label
+            ImdbVotes   = $null
+            ImdbId      = $null
             WikidataQid = $wikidataQid
           }) | Out-Null
         }
       }
-      elseif ($assessment.Status -in @('not_found','error')) {
-        $label = if ($assessment.Status -eq 'not_found') { 'IMDb not found' } else { 'IMDb lookup error' }
+      else {
+        if (-not $ctxByKey.ContainsKey($imdbKey)) {
+          $ctxByKey[$imdbKey] = [pscustomobject]@{
+            Title    = $title
+            Genre    = $genre
+            Premiere = $premiere
+            Network  = $networkName
+            Qid      = $wikidataQid
+          }
+          $pending.Add([pscustomobject]@{
+            ImdbKey      = $imdbKey
+            Title        = $title
+            PremiereYear = $premYear
+            TitleHref    = $titleHref
+            Network      = $networkName
+            DelayMs      = $RequestDelayMs
+          }) | Out-Null
+        }
+      }
+    }
+  }
+}
+
+# ------------------ PARALLEL (PS7+) / SEQUENTIAL LOOKUPS ------------------
+
+# Self-contained assessment scriptblock for child runspaces (no external function refs).
+$AssessSB = {
+  param($Title,$PremiereYear,$DelayMs,$TitleHref,$NetworkHint)
+
+  function __InvokeHttp([string]$Uri) {
+    Invoke-WebRequest -Uri $Uri -Headers @{
+      'User-Agent'      = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) PowerShell scraper'
+      'Accept-Language' = 'en-US,en;q=0.9'
+    } -ErrorAction Stop
+  }
+
+  function __GetImdbRating([string]$ImdbId) {
+    try {
+      $titleUrl = "https://www.imdb.com/title/$ImdbId/"
+      $resp = __InvokeHttp $titleUrl
+      $ldRe = [regex]::new('<script[^>]+type=["'']application/ld\+json["''][^>]*>(.*?)</script>', 'IgnoreCase,Singleline')
+      $best = $null
+      foreach ($m in $ldRe.Matches($resp.Content)) {
+        $jsonText = $m.Groups[1].Value
+        try {
+          $j = $jsonText | ConvertFrom-Json
+          $objs = @()
+          if ($j -is [System.Collections.IEnumerable] -and -not ($j -is [string])) { $objs = $j } else { $objs = @($j) }
+          foreach ($o in $objs) {
+            if ($o.aggregateRating -and $o.aggregateRating.ratingValue -and $o.aggregateRating.ratingCount) { $best = $o; break }
+          }
+          if ($best) { break }
+        } catch { continue }
+      }
+      if (-not $best) { return @{ Status='not_found' } }
+      $val = [double]$best.aggregateRating.ratingValue
+      $cntRaw = $best.aggregateRating.ratingCount
+      if ($cntRaw -isnot [int]) { $cntRaw = ($cntRaw.ToString() -replace ',', '') }
+      $cnt = [int]$cntRaw
+      return @{ Status='ok'; Id=$ImdbId; Rating=$val; Votes=$cnt }
+    } catch {
+      return @{ Status='error' }
+    }
+  }
+
+  function __TryImdbFromWikiPage([string]$WikiHref,[int]$DelayMs) {
+    try {
+      $uri = $WikiHref
+      if ($uri -notmatch '^https?://') { $uri = 'https://en.wikipedia.org' + $WikiHref }
+      Start-Sleep -Milliseconds $DelayMs
+      $resp = __InvokeHttp $uri
+      $m = [regex]::Match($resp.Content, '/title/(tt\d+)', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+      if ($m.Success) { return $m.Groups[1].Value }
+    } catch {}
+    return $null
+  }
+
+  function __TryImdbFromWebSearch([string]$Title,[int]$PremiereYear,[int]$DelayMs,[string]$NetworkHint) {
+    $queries = @()
+    $clean = $Title
+    if ($PremiereYear) { $queries += "$clean ($PremiereYear) site:imdb.com/title" }
+    if ($NetworkHint) { $queries += "$clean `"$NetworkHint`" site:imdb.com/title" }
+    $queries += "$clean site:imdb.com/title"
+    foreach ($q in $queries) {
+      $enc = [System.Uri]::EscapeDataString($q)
+      foreach ($engine in @('bing','ddg')) {
+        try {
+          $url = if ($engine -eq 'bing') { "https://www.bing.com/search?q=$enc" } else { "https://duckduckgo.com/html/?q=$enc" }
+          Start-Sleep -Milliseconds $DelayMs
+          $resp = __InvokeHttp $url
+          $m = [regex]::Match($resp.Content, '/title/(tt\d+)', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+          if ($m.Success) { return $m.Groups[1].Value }
+        } catch { continue }
+      }
+    }
+    return $null
+  }
+
+  try {
+    # IMDb suggestion
+    foreach ($queryTitle in @($Title)) {
+      if ([string]::IsNullOrWhiteSpace($queryTitle)) { continue }
+      try {
+        $first = ($queryTitle.Trim())[0].ToString().ToLower()
+        $sugUrl = "https://v2.sg.media-imdb.com/suggestion/$first/" + [System.Uri]::EscapeDataString($queryTitle) + ".json"
+        $sugResp = __InvokeHttp $sugUrl
+        $json = $sugResp.Content | ConvertFrom-Json
+        if ($json -and $json.d) {
+          $scored = foreach ($d in $json.d) {
+            if (-not ($d.id -match '^tt\d+')) { continue }
+            $score = 0
+            if ($d.l -eq $queryTitle) { $score += 2 }
+            if ($PremiereYear -and $d.y -eq $PremiereYear) { $score += 3 }
+            elseif ($PremiereYear -and $d.yr -and ($d.yr -match [regex]::Escape("$PremiereYear"))) { $score += 2 }
+            if ($d.q -match '(?i)TV') { $score += 1 }
+            if ($NetworkHint -and $d.s -and ($d.s -match [regex]::Escape($NetworkHint))) { $score += 1 }
+            if ($d.q -match '(?i)film') { $score -= 2 }
+            [pscustomobject]@{ Id=$d.id; Score=$score }
+          }
+          if ($scored) {
+            $ttId = ($scored | Sort-Object Score -Descending | Select-Object -First 1).Id
+            if ($ttId) { Start-Sleep -Milliseconds $DelayMs; return __GetImdbRating $ttId }
+          }
+        }
+      } catch { }
+    }
+
+    # IMDb find
+    try {
+      $findUrl = "https://www.imdb.com/find/?s=tt&q=" + [System.Uri]::EscapeDataString($Title)
+      $findResp = __InvokeHttp $findUrl
+      $m = [regex]::Match($findResp.Content, '/title/(tt\d+)/')
+      if ($m.Success) {
+        $ttId = $m.Groups[1].Value
+        Start-Sleep -Milliseconds $DelayMs
+        return __GetImdbRating $ttId
+      }
+    } catch { }
+
+    # Wikipedia page ext link
+    if ($TitleHref) {
+      $tt3 = __TryImdbFromWikiPage $TitleHref $DelayMs
+      if ($tt3) { Start-Sleep -Milliseconds $DelayMs; return __GetImdbRating $tt3 }
+    }
+
+    # Web search
+    $tt4 = __TryImdbFromWebSearch $Title $PremiereYear $DelayMs $NetworkHint
+    if ($tt4) { Start-Sleep -Milliseconds $DelayMs; return __GetImdbRating $tt4 }
+
+    return @{ Status='not_found' }
+  } catch {
+    return @{ Status='error' }
+  }
+}
+
+# *************** FIX: stringify the assessor block for -Parallel ***************
+$AssessSbString = $AssessSB.ToString()
+# ********************************************************************************
+
+if ($pending.Count -gt 0) {
+  $parOut = @()
+
+  if ($PSVersionTable.PSVersion.Major -ge 7) {
+    $parOut = $pending | ForEach-Object -Parallel {
+      # Re-create the assessor scriptblock inside the child runspace
+      $sb = [scriptblock]::Create($using:AssessSbString)
+
+      $ass = & $sb `
+        -Title        $_.Title `
+        -PremiereYear $_.PremiereYear `
+        -DelayMs      $_.DelayMs `
+        -TitleHref    $_.TitleHref `
+        -NetworkHint  $_.Network
+
+      [pscustomobject]@{ Key = $_.ImdbKey; Assessment = $ass }
+    } -ThrottleLimit $ParallelThrottle
+  }
+  else {
+    foreach ($p in $pending) {
+      $ass = & $AssessSB -Title $p.Title -PremiereYear $p.PremiereYear -DelayMs $p.DelayMs -TitleHref $p.TitleHref -NetworkHint $p.Network
+      $parOut += [pscustomobject]@{ Key=$p.ImdbKey; Assessment=$ass }
+    }
+  }
+
+  foreach ($po in $parOut) {
+    if (-not $po) { continue }
+    $key = $po.Key
+    $ass = $po.Assessment
+    if (-not $key) { continue }
+
+    $imdbCache[$key] = $ass
+
+    # enrich results and persistent cache
+    $ctx = $ctxByKey[$key]
+    if ($usePersistentCache) {
+      Update-PersistentCacheEntry -Cache $persistCache -Key $key -Assessment $ass -Qid $ctx.Qid
+      $cacheDirty = $true
+    }
+
+    if ($ctx) {
+      if ($ass.Status -eq 'ok') {
+        $meets = ($ass.Rating -ge $MinRating -and $ass.Votes -ge $MinVotes)
+        if ($meets -or $IncludeBelowThreshold.IsPresent) {
+          $results.Add([pscustomobject]@{
+            Title       = $ctx.Title
+            Genre       = $ctx.Genre
+            Premiere    = $ctx.Premiere
+            Network     = $ctx.Network
+            ImdbRating  = [math]::Round($ass.Rating, 1)
+            ImdbVotes   = $ass.Votes
+            ImdbId      = $ass.Id
+            WikidataQid = $ctx.Qid
+          }) | Out-Null
+        }
+      }
+      else {
+        $label = if ($ass.Status -eq 'not_found') { 'IMDb not found' } else { 'IMDb lookup error' }
         $results.Add([pscustomobject]@{
-          Title       = $title
-          Genre       = $genre
-          Premiere    = $premiere
-          Network     = $networkName
+          Title       = $ctx.Title
+          Genre       = $ctx.Genre
+          Premiere    = $ctx.Premiere
+          Network     = $ctx.Network
           ImdbRating  = $label
           ImdbVotes   = $null
           ImdbId      = $null
-          WikidataQid = $wikidataQid
+          WikidataQid = $ctx.Qid
         }) | Out-Null
       }
     }
@@ -891,7 +1110,6 @@ if ($OutputCsv) {
     $new = if ($mapNew.ContainsKey($k)) { $mapNew[$k] } else { $null }
 
     if ($new) {
-      # Start from new (current scrape)
       $row = [pscustomobject]@{
         Title       = $new.Title
         Genre       = $new.Genre
@@ -901,7 +1119,6 @@ if ($OutputCsv) {
         ImdbVotes   = $new.ImdbVotes
         ImdbId      = $new.ImdbId
         WikidataQid = $new.WikidataQid
-        # delta columns (filled below)
         ChangeType     = $null
         SeenThisRun    = 'Yes'
         FirstSeen      = $null
@@ -912,10 +1129,8 @@ if ($OutputCsv) {
         DeltaVotes     = $null
       }
 
-      # FirstSeen
       if ($old -and $old.FirstSeen) { $row.FirstSeen = $old.FirstSeen } else { $row.FirstSeen = $nowIso }
 
-      # Prev / Delta
       if ($old) {
         $row.PrevImdbRating = $old.ImdbRating
         $row.PrevImdbVotes  = $old.ImdbVotes
@@ -930,7 +1145,6 @@ if ($OutputCsv) {
         }
       }
 
-      # ChangeType
       if (-not $old) {
         $row.ChangeType = 'Added'
       } else {
@@ -941,7 +1155,6 @@ if ($OutputCsv) {
       $mergedList.Add($row) | Out-Null
     }
     else {
-      # Not seen this run: keep old and mark Stale
       $row = [pscustomobject]@{
         Title       = $old.Title
         Genre       = $old.Genre
@@ -964,7 +1177,6 @@ if ($OutputCsv) {
     }
   }
 
-  # Strong sort and write
   $merged    = $mergedList.ToArray()
   $sortedAll = if ($merged.Count -gt 0) { Sort-ByOutputOrder -Rows $merged } else { @() }
 
