@@ -2,8 +2,12 @@
 .SYNOPSIS
   Combined scraper for “List of <Service> original programming” Wikipedia pages.
 
-  Key features
-  - REQUIRED: URLs are provided via a config CSV (use -ConfigCsv .\networks.csv); script no longer hardcodes URL lists
+  - REQUIRED: URLs come from a config CSV via -ConfigCsv (no hardcoded URL list in script)
+      * CSV must have columns: URL, Enabled (case-insensitive). Example:
+        URL,Enabled
+        https://en.wikipedia.org/wiki/List_of_Netflix_original_programming,true
+        'https://en.wikipedia.org/wiki/List_of_HBO_original_programming#Upcoming_programming',true
+      * Leading/trailing quotes are stripped; only Enabled truthy rows are used.
   - Skips rows in "Upcoming" section(s)
   - Default filter: Premiere is in the target Year AND includes a month/day (not year-only)
   - Optional filter A (relative window): -OnlyTwoMonthsAgoMonth limits to the entire month from two months ago
@@ -17,22 +21,22 @@
   - Persistent IMDb cache (DEFAULT ON): disk-backed JSON cache; disable with -NoPersistentCache
   - Delta columns in CSV/JSON/Excel: ChangeType, SeenThisRun, FirstSeen, LastSeen,
                                      PrevImdbRating, PrevImdbVotes, DeltaRating, DeltaVotes.
-  - Parallel IMDb lookups (DEFAULT if PS7+): throttled ForEach-Object -Parallel (PS7-safe fix included).
+  - Parallel IMDb lookups (DEFAULT if PS7+): throttled ForEach-Object -Parallel (PS7-safe with scriptblock stringization).
   - Flexible export formats: CSV (default), plus optional -OutputJson and/or -OutputExcel (ImportExcel).
   - Genre/type filters: -IncludeGenre 'Drama','Documentary' and/or -ExcludeGenre 'Reality' (fuzzy/diacritics-insensitive).
-  - Verbosity & logging: honors -Verbose/-Debug; optional -LogPath with size-based rotation to capture errors & (with -Debug) skip reasons.
-  - Open after write: -OpenCsv launches the CSV after it is written.
+  - Verbosity & logging: -Verbose / -Debug and optional -LogPath for a rolling log (rotates at ~1 MB).
+  - Open after write: -OpenCsv to launch the written CSV when the run finishes (best-effort).
+  - NEW: Randomized small jitter around request delays (±20%) to look less bot-like.
 
 .OUTPUT
   Title, Genre, Premiere, Network, ImdbRating, ImdbVotes, ImdbId, WikidataQid, and delta columns
 #>
 
-[CmdletBinding(DefaultParameterSetName='Default')]
+[CmdletBinding(DefaultParameterSetName='Default', SupportsShouldProcess=$false)]
 param(
-  # === REQUIRED config of URLs via CSV ===
+  # --- REQUIRED configuration with URL list ---
   [Parameter(Mandatory=$true)]
-  [ValidateNotNullOrEmpty()]
-  [string]$ConfigCsv,   # CSV with columns: URL[,Enabled]
+  [string]$ConfigCsv,
 
   # --- Output options ---
   [string]$OutputCsv = "C:\Personal Scripts\CurrentMonthTVShows.csv",
@@ -40,7 +44,7 @@ param(
   [string]$OutputJsonPath,
   [switch]$OutputExcel,
   [string]$OutputExcelPath,
-  [switch]$OpenCsv,  # NEW: open CSV after writing
+  [switch]$OpenCsv,  # open CSV after write
 
   # --- Genre/type filters ---
   [string[]]$IncludeGenre,
@@ -50,7 +54,11 @@ param(
   [int]$Year = 2025,
   [double]$MinRating = 8.4,
   [int]$MinVotes = 1000,
+
+  # Base request delay in milliseconds for polite scraping (jitter will be applied around this)
   [int]$RequestDelayMs = 250,
+
+  # Include below threshold (keeps rows with low IMDb metrics or lookup failures)
   [switch]$IncludeBelowThreshold,
 
   # Relative month window
@@ -75,32 +83,32 @@ param(
   [int]$ParallelThrottle = 6,
 
   # Logging
-  [string]$LogPath,
-  [long]$LogMaxBytes = 2MB
+  [string]$LogPath
 )
 
-# ------------------- Logging helpers -------------------
+# ---------------- Logging helpers ----------------
 $script:LogInitialized = $false
-$script:LogTarget = $null
-function Setup-Log {
-  param([string]$Path,[long]$MaxBytes)
+function Initialize-Log {
+  param([string]$Path)
   if (-not $Path) { return }
   try {
     $dir = Split-Path -Parent $Path
-    if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
+    # rotate if > ~1 MB
     if (Test-Path $Path) {
-      $size = (Get-Item $Path).Length
-      if ($size -gt $MaxBytes) {
-        $ts = Get-Date -Format 'yyyyMMdd-HHmmss'
-        $bak = "{0}.{1}.bak" -f $Path, $ts
-        Move-Item -LiteralPath $Path -Destination $bak -Force
+      $len = (Get-Item $Path).Length
+      if ($len -gt 1MB) {
+        $stamp = (Get-Date).ToString('yyyyMMdd-HHmmss')
+        $bak = [IO.Path]::Combine($dir, ("{0}.{1}.log" -f ([IO.Path]::GetFileNameWithoutExtension($Path)), $stamp))
+        Copy-Item -LiteralPath $Path -Destination $bak -Force
+        Clear-Content -LiteralPath $Path
       }
     }
-    "==== Run {0} ====" -f (Get-Date).ToString('s') | Out-File -FilePath $Path -Encoding UTF8 -Append
-    $script:LogTarget = $Path
+    $header = "[{0}] === Run start ===" -f (Get-Date).ToString('o')
+    Add-Content -LiteralPath $Path -Value $header
     $script:LogInitialized = $true
   } catch {
-    Write-Warning ("[Log] Failed to init log '{0}': {1}" -f $Path, $_.Exception.Message)
+    Write-Warning ("[Log] Failed to initialize log '{0}': {1}" -f $Path, $_.Exception.Message)
   }
 }
 
@@ -110,16 +118,96 @@ function Write-Log {
     [string]$Level,
     [string]$Message
   )
-  if (-not $script:LogInitialized -or -not $script:LogTarget) { return }
+  if (-not $LogPath) { return }
+  if (-not $script:LogInitialized) { Initialize-Log -Path $LogPath }
   try {
-    $line = "[{0}] [{1}] {2}" -f (Get-Date).ToString('s'), $Level, $Message
-    $line | Out-File -FilePath $script:LogTarget -Encoding UTF8 -Append
-  } catch { }
+    $line = "[{0}] {1}: {2}" -f (Get-Date).ToString('o'), $Level, $Message
+    Add-Content -LiteralPath $LogPath -Value $line
+  } catch {
+    Write-Warning ("[Log] Failed to write to log '{0}': {1}" -f $LogPath, $_.Exception.Message)
+  }
 }
 
-if ($LogPath) { Setup-Log -Path $LogPath -MaxBytes $LogMaxBytes }
+function Warn-And-Log {
+  param([string]$Message)
+  Write-Warning $Message
+  Write-Log -Level 'WARN' -Message $Message
+}
 
-# ------------------- Utilities -------------------
+# ------------- Delay jitter helpers (±20% by default) -------------
+# Returns an integer millisecond delay jittered around the base delay.
+function Get-JitterMs {
+  param(
+    [Parameter(Mandatory)][int]$BaseMs,
+    [double]$Fraction = 0.20  # 20% default
+  )
+  if ($BaseMs -le 0) { return 0 }
+  # random in [-Fraction, +Fraction]
+  $r = Get-Random -Minimum (-1.0) -Maximum 1.0
+  $delta = [double]$BaseMs * $Fraction * $r
+  $ms = [int][math]::Round([double]$BaseMs + $delta)
+  if ($ms -lt 0) { $ms = 0 }
+  return $ms
+}
+
+function Sleep-WithJitter {
+  param([int]$BaseMs)
+  $ms = Get-JitterMs -BaseMs $BaseMs
+  if ($ms -gt 0) { Start-Sleep -Milliseconds $ms }
+  Write-Debug ("[JITTER] Slept {0} ms (base {1})" -f $ms, $BaseMs)
+  Write-Log -Level 'DEBUG' -Message ("Slept {0} ms (base {1})" -f $ms, $BaseMs)
+}
+
+# ---------------- Config CSV loader ----------------
+function Load-UrlsFromConfigCsv {
+  param([Parameter(Mandatory)][string]$Path)
+  if (-not (Test-Path -LiteralPath $Path)) {
+    throw "Config CSV not found: $Path"
+  }
+  $rows = @()
+  try { $rows = Import-Csv -LiteralPath $Path }
+  catch { throw "Failed to read Config CSV '$Path': $($_.Exception.Message)" }
+
+  $urls = New-Object System.Collections.Generic.List[string]
+  foreach ($row in $rows) {
+    $rawUrl = $null; $enabledRaw = $null
+    foreach ($p in $row.PSObject.Properties) {
+      if ($p.Name -match '^(?i)url$')     { $rawUrl = $p.Value }
+      elseif ($p.Name -match '^(?i)enabled$') { $enabledRaw = $p.Value }
+    }
+    if (-not $rawUrl) { continue }
+
+    # normalize enabled flag
+    $isEnabled = $true
+    if ($null -ne $enabledRaw) {
+      $s = "$enabledRaw".Trim().ToLowerInvariant()
+      if ($s -in @('false','0','no','n','off')) { $isEnabled = $false }
+    }
+
+    # strip outer quotes & whitespace
+    $u = "$rawUrl".Trim()
+    if ($u.Length -gt 1) {
+      if (($u.StartsWith("'") -and $u.EndsWith("'")) -or ($u.StartsWith('"') -and $u.EndsWith('"'))) {
+        $u = $u.Substring(1, $u.Length-2)
+      }
+    }
+    $u = $u.Trim()
+
+    # validate URI
+    try {
+      $uri = [uri]$u
+      if ($isEnabled) { $urls.Add($uri.AbsoluteUri) | Out-Null }
+    } catch {
+      Warn-And-Log ("[Config] Skipping invalid URL '{0}': {1}" -f $rawUrl, $_.Exception.Message)
+    }
+  }
+  if ($urls.Count -eq 0) { throw "No enabled, valid URLs found in $Path" }
+  Write-Host ("[Config] Loaded {0} URL(s) from {1}" -f $urls.Count, $Path)
+  Write-Log -Level 'INFO' -Message ("Loaded {0} URLs from {1}" -f $urls.Count, $Path)
+  return $urls.ToArray()
+}
+
+# ---------------- Core helpers ----------------
 function Remove-Html {
   param([string]$Html)
   if ([string]::IsNullOrWhiteSpace($Html)) { return $null }
@@ -166,16 +254,10 @@ function Get-FirstYearFromText {
 
 function Invoke-Http {
   param([Parameter(Mandatory)] [string]$Uri)
-  Write-Verbose ("[HTTP] GET {0}" -f $Uri)
-  try {
-    Invoke-WebRequest -Uri $Uri -Headers @{
-      'User-Agent'      = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) PowerShell scraper'
-      'Accept-Language' = 'en-US,en;q=0.9'
-    } -ErrorAction Stop
-  } catch {
-    Write-Log -Level 'ERROR' -Message ("HTTP error for '{0}': {1}" -f $Uri, $_.Exception.Message)
-    throw
-  }
+  Invoke-WebRequest -Uri $Uri -Headers @{
+    'User-Agent'      = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) PowerShell scraper'
+    'Accept-Language' = 'en-US,en;q=0.9'
+  } -ErrorAction Stop
 }
 
 # Determine Network/Service from URL title
@@ -229,7 +311,7 @@ function Get-WikidataQidFromEnwikiTitle {
   try {
     $api = "https://en.wikipedia.org/w/api.php?action=query&format=json&prop=pageprops&ppprop=wikibase_item&titles=" +
            [System.Uri]::EscapeDataString($EnwikiTitle)
-    Start-Sleep -Milliseconds $DelayMs
+    Sleep-WithJitter -BaseMs $DelayMs
     $resp = Invoke-Http -Uri $api
     $j = $resp.Content | ConvertFrom-Json
     $page = ($j.query.pages.PSObject.Properties | Select-Object -First 1).Value
@@ -242,7 +324,7 @@ function Get-ImdbIdFromWikidataQid {
   param([Parameter(Mandatory)][string]$Qid,[int]$DelayMs=250)
   try {
     $url = "https://www.wikidata.org/wiki/Special:EntityData/$Qid.json"
-    Start-Sleep -Milliseconds $DelayMs
+    Sleep-WithJitter -BaseMs $DelayMs
     $resp = Invoke-Http -Uri $url
     $j = $resp.Content | ConvertFrom-Json
     $entity = $j.entities.$Qid
@@ -262,7 +344,7 @@ function Try-GetImdbIdFromWikipediaPage {
   try {
     $uri = $WikiHref
     if ($uri -notmatch '^https?://') { $uri = 'https://en.wikipedia.org' + $WikiHref }
-    Start-Sleep -Milliseconds $DelayMs
+    Sleep-WithJitter -BaseMs $DelayMs
     $resp = Invoke-Http -Uri $uri
     $m = [regex]::Match($resp.Content, '/title/(tt\d+)', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
     if ($m.Success) { return $m.Groups[1].Value }
@@ -296,7 +378,7 @@ function Try-GetImdbIdFromWebSearch {
     foreach ($engine in @('bing','ddg')) {
       try {
         $url = if ($engine -eq 'bing') { "https://www.bing.com/search?q=$enc" } else { "https://duckduckgo.com/html/?q=$enc" }
-        Start-Sleep -Milliseconds $DelayMs
+        Sleep-WithJitter -BaseMs $DelayMs
         $resp = Invoke-Http -Uri $url
         $m = [regex]::Match($resp.Content, '/title/(tt\d+)', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
         if ($m.Success) { return $m.Groups[1].Value }
@@ -354,6 +436,7 @@ function Get-ImdbAssessment {
       try {
         $firstLetter = ($queryTitle.Trim())[0].ToString().ToLower()
         $sugUrl = "https://v2.sg.media-imdb.com/suggestion/$firstLetter/" + [System.Uri]::EscapeDataString($queryTitle) + ".json"
+        Sleep-WithJitter -BaseMs $DelayMs
         $sugResp = Invoke-Http -Uri $sugUrl
         $json = $sugResp.Content | ConvertFrom-Json
         if ($json -and $json.d) {
@@ -370,7 +453,7 @@ function Get-ImdbAssessment {
           }
           if ($scored) {
             $ttId = ($scored | Sort-Object Score -Descending | Select-Object -First 1).Id
-            if ($ttId) { Start-Sleep -Milliseconds $DelayMs; return Get-ImdbRating -ImdbId $ttId }
+            if ($ttId) { Sleep-WithJitter -BaseMs $DelayMs; return Get-ImdbRating -ImdbId $ttId }
           }
         }
       } catch { }
@@ -378,11 +461,12 @@ function Get-ImdbAssessment {
 
     try {
       $findUrl = "https://www.imdb.com/find/?s=tt&q=" + [System.Uri]::EscapeDataString($Title)
+      Sleep-WithJitter -BaseMs $DelayMs
       $findResp = Invoke-Http -Uri $findUrl
       $m = [regex]::Match($findResp.Content, '/title/(tt\d+)/')
       if ($m.Success) {
         $ttId = $m.Groups[1].Value
-        Start-Sleep -Milliseconds $DelayMs
+        Sleep-WithJitter -BaseMs $DelayMs
         return Get-ImdbRating -ImdbId $ttId
       }
     } catch { }
@@ -397,16 +481,16 @@ function Get-ImdbAssessment {
     }
     if ($qid) {
       $tt2 = Get-ImdbIdFromWikidataQid -Qid $qid -DelayMs $DelayMs
-      if ($tt2) { Start-Sleep -Milliseconds $DelayMs; return Get-ImdbRating -ImdbId $tt2 }
+      if ($tt2) { Sleep-WithJitter -BaseMs $DelayMs; return Get-ImdbRating -ImdbId $tt2 }
     }
 
     if ($TitleHref) {
       $tt3 = Try-GetImdbIdFromWikipediaPage -WikiHref $TitleHref -DelayMs $DelayMs
-      if ($tt3) { Start-Sleep -Milliseconds $DelayMs; return Get-ImdbRating -ImdbId $tt3 }
+      if ($tt3) { Sleep-WithJitter -BaseMs $DelayMs; return Get-ImdbRating -ImdbId $tt3 }
     }
 
     $tt4 = Try-GetImdbIdFromWebSearch -Title $Title -PremiereYear $PremiereYear -DelayMs $DelayMs -NetworkHint $NetworkHint
-    if ($tt4) { Start-Sleep -Milliseconds $DelayMs; return Get-ImdbRating -ImdbId $tt4 }
+    if ($tt4) { Sleep-WithJitter -BaseMs $DelayMs; return Get-ImdbRating -ImdbId $tt4 }
 
     return @{ Status='not_found' }
   } catch {
@@ -537,9 +621,9 @@ function Load-PersistentCache {
         }
       }
       Write-Host ("[Cache] Loaded {0} entries from {1}" -f $map.Count, $Path)
+      Write-Log -Level 'INFO' -Message ("Loaded cache: {0} entries from {1}" -f $map.Count, $Path)
     } catch {
-      Write-Warning ("[Cache] Failed to load '{0}': {1}" -f $Path, $_.Exception.Message)
-      Write-Log -Level 'WARN' -Message ("Cache load failed for '{0}': {1}" -f $Path, $_.Exception.Message)
+      Warn-And-Log ("[Cache] Failed to load '{0}': {1}" -f $Path, $_.Exception.Message)
     }
   }
   return $map
@@ -567,9 +651,9 @@ function Save-PersistentCache {
     }
     $list | ConvertTo-Json -Depth 5 | Out-File -FilePath $Path -Encoding UTF8
     Write-Host ("[Cache] Saved {0} entries to {1}" -f $Map.Count, $Path)
+    Write-Log -Level 'INFO' -Message ("Saved cache: {0} entries to {1}" -f $Map.Count, $Path)
   } catch {
-    Write-Warning ("[Cache] Failed to save '{0}': {1}" -f $Path, $_.Exception.Message)
-    Write-Log -Level 'WARN' -Message ("Cache save failed for '{0}': {1}" -f $Path, $_.Exception.Message)
+    Warn-And-Log ("[Cache] Failed to save '{0}': {1}" -f $Path, $_.Exception.Message)
   }
 }
 
@@ -751,7 +835,7 @@ function Should-KeepByGenre {
 
   if (($inc.Count -eq 0) -and ($exc.Count -eq 0)) { return $true }
 
-  # Include check
+  # Include check: require at least one hit if include list present
   $includeOk = $true
   if ($inc.Count -gt 0) {
     $includeOk = $false
@@ -763,7 +847,7 @@ function Should-KeepByGenre {
     }
   }
 
-  # Exclude check
+  # Exclude check: drop on any hit
   $excludeOk = $true
   if ($exc.Count -gt 0) {
     foreach ($t in $rowTokens) {
@@ -776,69 +860,12 @@ function Should-KeepByGenre {
 
   return ($includeOk -and $excludeOk)
 }
+# -------------------------------------------------------------
 
-# -------------------- Config loader --------------------
-function Load-UrlsFromConfigCsv {
-  param([Parameter(Mandatory)][string]$Path)
-  if (-not (Test-Path $Path)) { throw "Config CSV not found: $Path" }
-  Write-Verbose ("[Config] Loading URLs from {0}" -f $Path)
-  $rows = @()
-  try {
-    $rows = Import-Csv -Path $Path
-  } catch {
-    Write-Log -Level 'ERROR' -Message ("Failed to read config CSV '{0}': {1}" -f $Path, $_.Exception.Message)
-    throw
-  }
-
-  $urls = New-Object System.Collections.Generic.List[string]
-  foreach ($r in $rows) {
-    # Resolve columns case-insensitively
-    $urlProp = $r.PSObject.Properties | Where-Object { $_.Name -match '^(?i)url|link$' } | Select-Object -First 1
-    if (-not $urlProp) { continue }
-    $raw = [string]$urlProp.Value
-    if ([string]::IsNullOrWhiteSpace($raw)) { continue }
-
-    # Trim surrounding quotes and whitespace
-    $u = $raw.Trim() -replace "^[`'`"]+|[`'`"]+$",""
-    # Enabled? default true if not present
-    $enabled = $true
-    $enProp = $r.PSObject.Properties | Where-Object { $_.Name -match '^(?i)enabled|active$' } | Select-Object -First 1
-    if ($enProp) {
-      $val = [string]$enProp.Value
-      if ($val) {
-        $enabled = ($val -match '^(?i)true|1|yes|y$')
-      }
-    }
-
-    if (-not $enabled) {
-      Write-Debug ("[Config] Skipping disabled URL: {0}" -f $u)
-      continue
-    }
-
-    # Validate
-    $ok = $false
-    try {
-      $ok = [System.Uri]::IsWellFormedUriString($u,[System.UriKind]::Absolute)
-    } catch { $ok = $false }
-
-    if ($ok) {
-      $urls.Add($u) | Out-Null
-    } else {
-      Write-Warning ("[Config] Invalid URL skipped: {0}" -f $u)
-      Write-Log -Level 'WARN' -Message ("Invalid URL skipped: {0}" -f $u)
-    }
-  }
-
-  if ($urls.Count -eq 0) { throw "No valid URLs found in $Path" }
-
-  Write-Host ("[Config] Loaded {0} URL(s) from {1}" -f $urls.Count, $Path)
-  return $urls.ToArray()
-}
-
-# ------------------- Main -------------------
+# --- Main scrape across one or more URLs ---
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
 
-# Load URLs (required)
+# Load URLs from config CSV (REQUIRED)
 $Urls = Load-UrlsFromConfigCsv -Path $ConfigCsv
 
 $tableRe = [regex]::new('<table[^>]*class="[^"]*wikitable[^"]*"[^>]*>.*?<\/table>', 'IgnoreCase,Singleline')
@@ -889,11 +916,13 @@ $ctxByKey = @{}
 
 foreach ($Url in $Urls) {
   try {
+    # courtesy jittered delay between page fetches
+    Sleep-WithJitter -BaseMs $RequestDelayMs
     $resp = Invoke-Http -Uri $Url
     $html = $resp.Content
   } catch {
-    Write-Warning ("Failed to download '{0}': {1}" -f $Url, $_.Exception.Message)
-    Write-Log -Level 'WARN' -Message ("Failed to download '{0}': {1}" -f $Url, $_.Exception.Message)
+    $msg = ("Failed to download '{0}': {1}" -f $Url, $_.Exception.Message)
+    Warn-And-Log $msg
     continue
   }
 
@@ -964,13 +993,17 @@ foreach ($Url in $Urls) {
       $title    = $cells[$idxTitle]
       $genre    = $cells[$idxGenre]
       $premiere = $cells[$idxPremiere]
-      if ([string]::IsNullOrWhiteSpace($title) -or [string]::IsNullOrWhiteSpace($premiere)) { continue }
+      if ([string]::IsNullOrWhiteSpace($title) -or [string]::IsNullOrWhiteSpace($premiere)) {
+        Write-Verbose ("[Skip] Missing required fields (title/premiere) on network {0}" -f $networkName)
+        Write-Log -Level 'INFO' -Message ("Skip row (missing fields) on {0}: {1}" -f $networkName, $title)
+        continue
+      }
 
       # --- Genre filters (optional) ---
       if ($IncludeGenre -or $ExcludeGenre) {
         if (-not (Should-KeepByGenre -GenreText $genre -Include $IncludeGenre -Exclude $ExcludeGenre)) {
-          Write-Debug ("[Skip/Genre] {0} - {1}" -f $title, $genre)
-          if ($PSBoundParameters.ContainsKey('Debug')) { Write-Log -Level 'DEBUG' -Message ("SKIP genre: {0} - {1}" -f $title, $genre) }
+          Write-Verbose ("[Skip] Genre filtered out: {0}" -f $title)
+          Write-Log -Level 'INFO' -Message ("Skip by genre: {0} [{1}]" -f $title, $genre)
           continue
         }
       }
@@ -984,12 +1017,12 @@ foreach ($Url in $Urls) {
       $premDate = Get-PremiereDate $premiere
 
       if ($useMonthWindow) {
-        if (-not $premDate) { Write-Debug ("[Skip/Window no date] {0}" -f $title); continue }
-        if ($premDate -lt $windowStart -or $premDate -ge $windowEndExclusive) { Write-Debug ("[Skip/Window out] {0} ({1})" -f $title,$premDate.ToShortDateString()); continue }
+        if (-not $premDate) { continue }
+        if ($premDate -lt $windowStart -or $premDate -ge $windowEndExclusive) { continue }
       } else {
         $hasYear        = ($premiere -match $yearPattern)
         $hasMonthOrDate = ($premiere -match $monthPattern) -or ($premiere -match $isoDatePattern) -or ($premiere -match $usDatePattern)
-        if (-not ($hasYear -and $hasMonthOrDate)) { Write-Debug ("[Skip/Year+Month missing] {0} - {1}" -f $title,$premiere); continue }
+        if (-not ($hasYear -and $hasMonthOrDate)) { continue }
       }
 
       # Collect Wikidata QID (quick try)
@@ -1033,9 +1066,6 @@ foreach ($Url in $Urls) {
               ImdbId      = $assessment.Id
               WikidataQid = $wikidataQid
             }) | Out-Null
-          } else {
-            Write-Debug ("[Skip/Threshold] {0} rating={1} votes={2}" -f $title, $assessment.Rating, $assessment.Votes)
-            if ($PSBoundParameters.ContainsKey('Debug')) { Write-Log -Level 'DEBUG' -Message ("SKIP threshold: {0} rating={1} votes={2}" -f $title, $assessment.Rating, $assessment.Votes) }
           }
         } else {
           $label = if ($assessment.Status -eq 'not_found') { 'IMDb not found' } else { 'IMDb lookup error' }
@@ -1087,6 +1117,15 @@ $AssessSB = {
     } -ErrorAction Stop
   }
 
+  function __JitterMs([int]$BaseMs,[double]$Fraction=0.20) {
+    if ($BaseMs -le 0) { return 0 }
+    $r = Get-Random -Minimum (-1.0) -Maximum 1.0
+    $delta = [double]$BaseMs * $Fraction * $r
+    $ms = [int][math]::Round([double]$BaseMs + $delta)
+    if ($ms -lt 0) { $ms = 0 }
+    return $ms
+  }
+
   function __GetImdbRating([string]$ImdbId) {
     try {
       $titleUrl = "https://www.imdb.com/title/$ImdbId/"
@@ -1120,7 +1159,8 @@ $AssessSB = {
     try {
       $uri = $WikiHref
       if ($uri -notmatch '^https?://') { $uri = 'https://en.wikipedia.org' + $WikiHref }
-      Start-Sleep -Milliseconds $DelayMs
+      $sleep = __JitterMs $DelayMs
+      if ($sleep -gt 0) { Start-Sleep -Milliseconds $sleep }
       $resp = __InvokeHttp $uri
       $m = [regex]::Match($resp.Content, '/title/(tt\d+)', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
       if ($m.Success) { return $m.Groups[1].Value }
@@ -1139,7 +1179,8 @@ $AssessSB = {
       foreach ($engine in @('bing','ddg')) {
         try {
           $url = if ($engine -eq 'bing') { "https://www.bing.com/search?q=$enc" } else { "https://duckduckgo.com/html/?q=$enc" }
-          Start-Sleep -Milliseconds $DelayMs
+          $sleep = __JitterMs $DelayMs
+          if ($sleep -gt 0) { Start-Sleep -Milliseconds $sleep }
           $resp = __InvokeHttp $url
           $m = [regex]::Match($resp.Content, '/title/(tt\d+)', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
           if ($m.Success) { return $m.Groups[1].Value }
@@ -1156,6 +1197,8 @@ $AssessSB = {
       try {
         $first = ($queryTitle.Trim())[0].ToString().ToLower()
         $sugUrl = "https://v2.sg.media-imdb.com/suggestion/$first/" + [System.Uri]::EscapeDataString($queryTitle) + ".json"
+        $sleep = __JitterMs $DelayMs
+        if ($sleep -gt 0) { Start-Sleep -Milliseconds $sleep }
         $sugResp = __InvokeHttp $sugUrl
         $json = $sugResp.Content | ConvertFrom-Json
         if ($json -and $json.d) {
@@ -1172,7 +1215,11 @@ $AssessSB = {
           }
           if ($scored) {
             $ttId = ($scored | Sort-Object Score -Descending | Select-Object -First 1).Id
-            if ($ttId) { Start-Sleep -Milliseconds $DelayMs; return __GetImdbRating $ttId }
+            if ($ttId) {
+              $sleep = __JitterMs $DelayMs
+              if ($sleep -gt 0) { Start-Sleep -Milliseconds $sleep }
+              return __GetImdbRating $ttId
+            }
           }
         }
       } catch { }
@@ -1181,11 +1228,14 @@ $AssessSB = {
     # IMDb find
     try {
       $findUrl = "https://www.imdb.com/find/?s=tt&q=" + [System.Uri]::EscapeDataString($Title)
+      $sleep = __JitterMs $DelayMs
+      if ($sleep -gt 0) { Start-Sleep -Milliseconds $sleep }
       $findResp = __InvokeHttp $findUrl
       $m = [regex]::Match($findResp.Content, '/title/(tt\d+)/')
       if ($m.Success) {
         $ttId = $m.Groups[1].Value
-        Start-Sleep -Milliseconds $DelayMs
+        $sleep = __JitterMs $DelayMs
+        if ($sleep -gt 0) { Start-Sleep -Milliseconds $sleep }
         return __GetImdbRating $ttId
       }
     } catch { }
@@ -1193,12 +1243,20 @@ $AssessSB = {
     # Wikipedia page ext link
     if ($TitleHref) {
       $tt3 = __TryImdbFromWikiPage $TitleHref $DelayMs
-      if ($tt3) { Start-Sleep -Milliseconds $DelayMs; return __GetImdbRating $tt3 }
+      if ($tt3) {
+        $sleep = __JitterMs $DelayMs
+        if ($sleep -gt 0) { Start-Sleep -Milliseconds $sleep }
+        return __GetImdbRating $tt3
+      }
     }
 
     # Web search
     $tt4 = __TryImdbFromWebSearch $Title $PremiereYear $DelayMs $NetworkHint
-    if ($tt4) { Start-Sleep -Milliseconds $DelayMs; return __GetImdbRating $tt4 }
+    if ($tt4) {
+      $sleep = __JitterMs $DelayMs
+      if ($sleep -gt 0) { Start-Sleep -Milliseconds $sleep }
+      return __GetImdbRating $tt4
+    }
 
     return @{ Status='not_found' }
   } catch {
@@ -1206,9 +1264,9 @@ $AssessSB = {
   }
 }
 
-# *************** FIX: stringify the assessor block for -Parallel ***************
+# *************** PS7-safe: stringify the assessor block for -Parallel ***************
 $AssessSbString = $AssessSB.ToString()
-# ********************************************************************************
+# ************************************************************************************
 
 if ($pending.Count -gt 0) {
   $parOut = @()
@@ -1264,9 +1322,6 @@ if ($pending.Count -gt 0) {
             ImdbId      = $ass.Id
             WikidataQid = $ctx.Qid
           }) | Out-Null
-        } else {
-          Write-Debug ("[Skip/Threshold] {0} rating={1} votes={2}" -f $ctx.Title, $ass.Rating, $ass.Votes)
-          if ($PSBoundParameters.ContainsKey('Debug')) { Write-Log -Level 'DEBUG' -Message ("SKIP threshold: {0} rating={1} votes={2}" -f $ctx.Title, $ass.Rating, $ass.Votes) }
         }
       }
       else {
@@ -1298,7 +1353,7 @@ $dedupNew
 $existing = @()
 if ($OutputCsv -and (Test-Path $OutputCsv)) {
   try   { $existing = @((Import-Csv $OutputCsv)) }
-  catch { Write-Warning ("Failed to read existing CSV '{0}': {1}" -f $OutputCsv, $_.Exception.Message) }
+  catch { Warn-And-Log ("Failed to read existing CSV '{0}': {1}" -f $OutputCsv, $_.Exception.Message) }
 }
 $shapeExisting = if ($existing -and $existing.Count -gt 0) { Select-OutputShape -Rows $existing } else { @() }
 
@@ -1308,6 +1363,7 @@ $addedCount   = ($delta.Added   | Measure-Object).Count
 $updatedCount = ($delta.Updated | Measure-Object).Count
 $removedCount = ($delta.Removed | Measure-Object).Count
 Write-Host ("[Delta] Added: {0}; Updated: {1}; Removed (not seen this run, kept in CSV): {2}" -f $addedCount, $updatedCount, $removedCount)
+Write-Log -Level 'INFO' -Message ("Delta: added={0} updated={1} removed={2}" -f $addedCount, $updatedCount, $removedCount)
 
 if ($DeltaJsonPath) {
   try {
@@ -1315,9 +1371,9 @@ if ($DeltaJsonPath) {
     if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
     $delta | ConvertTo-Json -Depth 6 | Out-File -FilePath $DeltaJsonPath -Encoding UTF8
     Write-Host ("[Delta] Wrote changelog to {0}" -f $DeltaJsonPath)
+    Write-Log -Level 'INFO' -Message ("Wrote delta JSON to {0}" -f $DeltaJsonPath)
   } catch {
-    Write-Warning ("Failed to write delta JSON '{0}': {1}" -f $DeltaJsonPath, $_.Exception.Message)
-    Write-Log -Level 'WARN' -Message ("Delta JSON write failed '{0}': {1}" -f $DeltaJsonPath, $_.Exception.Message)
+    Warn-And-Log ("Failed to write delta JSON '{0}': {1}" -f $DeltaJsonPath, $_.Exception.Message)
   }
 }
 
@@ -1334,6 +1390,7 @@ function Get-DerivedPath {
 }
 
 # --- Merge with delta columns, strong sort, write outputs ---
+$wroteCsv = $false
 if ($OutputCsv -or $OutputJson -or $OutputExcel) {
   # Ensure output directories exist
   function Ensure-Dir($path) {
@@ -1434,10 +1491,9 @@ if ($OutputCsv -or $OutputJson -or $OutputExcel) {
   # --- CSV (existing behavior) ---
   if ($OutputCsv) {
     Ensure-Dir $OutputCsv
-    $csvJustWrote = $false
     if ($sortedAll.Count -gt 0) {
       $sortedAll | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $OutputCsv
-      $csvJustWrote = $true
+      $wroteCsv = $true
     } else {
       if (-not (Test-Path $OutputCsv)) {
         "" | Select-Object `
@@ -1446,30 +1502,12 @@ if ($OutputCsv -or $OutputJson -or $OutputExcel) {
           @{n='ChangeType';e={}}, @{n='SeenThisRun';e={}}, @{n='FirstSeen';e={}}, @{n='LastSeen';e={}},
           @{n='PrevImdbRating';e={}}, @{n='PrevImdbVotes';e={}}, @{n='DeltaRating';e={}}, @{n='DeltaVotes';e={}} |
           Export-Csv -NoTypeInformation -Encoding UTF8 -Path $OutputCsv
-        $csvJustWrote = $true
-      }
-    }
-    if ($csvJustWrote) {
-      Write-Host ("Wrote CSV to {0}" -f $OutputCsv)
-      Write-Log -Level 'INFO' -Message ("Wrote CSV to {0}" -f $OutputCsv)
-
-      # --- NEW: Open after write ---
-      if ($OpenCsv.IsPresent) {
-        try {
-          if (Test-Path $OutputCsv) {
-            Start-Process -FilePath $OutputCsv | Out-Null
-            Write-Verbose ("Opened CSV '{0}'" -f $OutputCsv)
-            Write-Log -Level 'INFO' -Message ("Opened CSV '{0}'" -f $OutputCsv)
-          }
-        } catch {
-          Write-Warning ("Failed to open CSV '{0}': {1}" -f $OutputCsv, $_.Exception.Message)
-          Write-Log -Level 'WARN' -Message ("Open CSV failed '{0}': {1}" -f $OutputCsv, $_.Exception.Message)
-        }
+        $wroteCsv = $true
       }
     }
   }
 
-  # --- JSON ---
+  # --- JSON (optional) ---
   if ($OutputJson.IsPresent) {
     $jsonPath = if ($OutputJsonPath) { $OutputJsonPath } else { Get-DerivedPath -BasePath $OutputCsv -NewExtension '.json' }
     Ensure-Dir $jsonPath
@@ -1482,12 +1520,11 @@ if ($OutputCsv -or $OutputJson -or $OutputExcel) {
       Write-Host ("Wrote JSON to {0}" -f $jsonPath)
       Write-Log -Level 'INFO' -Message ("Wrote JSON to {0}" -f $jsonPath)
     } catch {
-      Write-Warning ("Failed to write JSON '{0}': {1}" -f $jsonPath, $_.Exception.Message)
-      Write-Log -Level 'WARN' -Message ("JSON write failed '{0}': {1}" -f $jsonPath, $_.Exception.Message)
+      Warn-And-Log ("Failed to write JSON '{0}': {1}" -f $jsonPath, $_.Exception.Message)
     }
   }
 
-  # --- Excel (requires ImportExcel) ---
+  # --- Excel (optional; requires ImportExcel) ---
   if ($OutputExcel.IsPresent) {
     $xlsxPath = if ($OutputExcelPath) { $OutputExcelPath } else { Get-DerivedPath -BasePath $OutputCsv -NewExtension '.xlsx' }
     Ensure-Dir $xlsxPath
@@ -1500,8 +1537,7 @@ if ($OutputCsv -or $OutputJson -or $OutputExcel) {
       }
       $importExcelAvailable = $true
     } catch {
-      Write-Warning "ImportExcel module not available. Install with: Install-Module ImportExcel -Scope CurrentUser"
-      Write-Log -Level 'WARN' -Message "ImportExcel not available"
+      Warn-And-Log "ImportExcel module not available. Install with: Install-Module ImportExcel -Scope CurrentUser"
     }
 
     if ($importExcelAvailable) {
@@ -1509,6 +1545,7 @@ if ($OutputCsv -or $OutputJson -or $OutputExcel) {
         if ($sortedAll.Count -gt 0) {
           $sortedAll | Export-Excel -Path $xlsxPath -WorksheetName 'Shows' -TableName 'Shows' -AutoSize -FreezeTopRow -BoldTopRow -ClearSheet
         } else {
+          # Create a sheet with headers (one blank row)
           "" | Select-Object `
             @{n='Title';e={}}, @{n='Genre';e={}}, @{n='Premiere';e={}}, @{n='Network';e={}},
             @{n='ImdbRating';e={}}, @{n='ImdbVotes';e={}}, @{n='ImdbId';e={}}, @{n='WikidataQid';e={}},
@@ -1519,14 +1556,24 @@ if ($OutputCsv -or $OutputJson -or $OutputExcel) {
         Write-Host ("Wrote Excel to {0}" -f $xlsxPath)
         Write-Log -Level 'INFO' -Message ("Wrote Excel to {0}" -f $xlsxPath)
       } catch {
-        Write-Warning ("Failed to write Excel '{0}': {1}" -f $xlsxPath, $_.Exception.Message)
-        Write-Log -Level 'WARN' -Message ("Excel write failed '{0}': {1}" -f $xlsxPath, $_.Exception.Message)
+        Warn-And-Log ("Failed to write Excel '{0}': {1}" -f $xlsxPath, $_.Exception.Message)
       }
     }
   }
 
   Write-Host ("Merged {0} existing + {1} new → wrote {2} total row(s); resorted by rating DESC, votes DESC, premiere ASC, title ASC." -f $shapeExisting.Count, $dedupNew.Count, $sortedAll.Count)
-  Write-Log -Level 'INFO' -Message ("Summary: existing={0} new={1} total={2}" -f $shapeExisting.Count, $dedupNew.Count, $sortedAll.Count)
+  Write-Log -Level 'INFO' -Message ("Merged {0} existing + {1} new → total {2}" -f $shapeExisting.Count, $dedupNew.Count, $sortedAll.Count)
+}
+
+# Open CSV after write (opt-in)
+if ($OpenCsv.IsPresent -and $OutputCsv -and (Test-Path $OutputCsv) -and $wroteCsv) {
+  try {
+    Start-Process -FilePath $OutputCsv | Out-Null
+    Write-Verbose ("Opened CSV: {0}" -f $OutputCsv)
+    Write-Log -Level 'INFO' -Message ("Opened CSV: {0}" -f $OutputCsv)
+  } catch {
+    Warn-And-Log ("Failed to open CSV '{0}': {1}" -f $OutputCsv, $_.Exception.Message)
+  }
 }
 
 # Save persistent cache if changed
