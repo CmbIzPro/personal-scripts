@@ -53,7 +53,7 @@ param(
   # --- Filters / thresholds ---
   [int]$Year = 2025,
   [double]$MinRating = 8.4,
-  [int]$MinVotes = 1000,
+  [int]$MinVotes = 10000,
 
   # Base request delay in milliseconds for polite scraping (jitter will be applied around this)
   [int]$RequestDelayMs = 250,
