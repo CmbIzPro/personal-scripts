@@ -1,35 +1,101 @@
-[CmdletBinding()]
+[CmdletBinding(DefaultParameterSetName='ByUrl')]
 param(
-    [Parameter(Mandatory)][string]$ListUrl,
+    # Provide an author name (e.g., "Brandon Sanderson") OR a Goodreads author URL.
+    [Parameter(ParameterSetName='ByAuthor', Mandatory=$true)]
+    [string]$Author,
+
+    [Parameter(ParameterSetName='ByUrl', Mandatory=$true)]
+    [Alias('ListUrl')]  # Back-compat
+    [string]$Url,
+
     [switch]$ShowProgress,
     [string]$OutCsv
 )
 
-#── helpers ──────────────────────────────────────────────────────────────
+# ── TLS for older PS ────────────────────────────────────────────────────
+try { [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 } catch {}
+
+# ── helpers ─────────────────────────────────────────────────────────────
+function Normalize-Url {
+    param([Parameter(Mandatory)][string]$Url)
+    $u = $Url.Trim() -replace ' ', '%20'
+    if ($u -notmatch '^[a-z][a-z0-9+\-.]*://') { $u = 'https://' + $u.TrimStart('/') }
+    $uri = $null
+    if (-not [System.Uri]::TryCreate($u, [System.UriKind]::Absolute, [ref]$uri)) {
+        throw "Bad URL after normalization: '$u'"
+    }
+    $uri.AbsoluteUri
+}
+
 function Get-Html {
     param([string]$Url,[int]$MaxRetry = 3)
     for ($i = 1; $i -le $MaxRetry; $i++) {
         try {
-            Write-Verbose "GET $Url (try $i)"
-            return Invoke-WebRequest -Uri $Url -UseBasicParsing `
-                   -UserAgent "Mozilla/5.0" -MaximumRedirection 3 -ErrorAction Stop
+            $norm = Normalize-Url $Url
+            Write-Verbose "GET $norm (try $i)"
+            return Invoke-WebRequest -Uri $norm -UseBasicParsing `
+                   -UserAgent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PowerShellScraper/1.3" `
+                   -MaximumRedirection 3 -ErrorAction Stop
         } catch {
-            if ($i -eq $MaxRetry) { throw }
-            Start-Sleep -Seconds ([math]::Pow(2,$i))
+            if ($i -eq $MaxRetry) {
+                throw "Invoke-WebRequest failed for URL '$Url' (normalized: '$norm'): $($_.Exception.Message)"
+            }
+            Start-Sleep -Seconds ([math]::Pow(2,$i))  # 2,4,8 backoff
         }
     }
 }
+
 function Parse-Int { param([string]$s) ($s -replace '[^\d]','') -as [int] }
 
-#── build base URL ───────────────────────────────────────────────────────
-if ($ListUrl -notmatch '/author/list/\d+') {
-    throw "ListUrl must be a Goodreads author/list page."
-}
-$baseUrl = $ListUrl.TrimEnd('/')
-if ($baseUrl -match '(.*?)(\?|&)page=\d+') { $baseUrl = $matches[1] }
-if ($baseUrl -match '\?') { $baseUrl += '&page={0}' } else { $baseUrl += '?page={0}' }
+function Resolve-GoodreadsAuthorListBaseUrl {
+    param(
+        [string]$Author,   # optional
+        [string]$Url       # optional: can be author/show or author/list
+    )
 
-#── scrape loop ──────────────────────────────────────────────────────────
+    $id = $null
+
+    if ($Url) {
+        # Accept either /author/show/<id> or /author/list/<id>
+        if ($Url -match 'goodreads\.com/author/(?:show|list)/(?<id>\d+)') {
+            $id = $Matches['id']
+        } else {
+            throw "URL must be a Goodreads author 'show' or 'list' page."
+        }
+    } elseif ($Author) {
+        # Lookup by name via search
+        $q = [System.Net.WebUtility]::UrlEncode($Author)
+        $searchUrl = "https://www.goodreads.com/search?q=$q&search_type=authors"
+        $searchHtml = (Get-Html $searchUrl).Content
+        $m = [regex]::Match($searchHtml, '/author/(?:list|show)/(?<id>\d+)', 'IgnoreCase')
+        if (!$m.Success) { throw "Could not find an author ID for '$Author'." }
+        $id = $m.Groups['id'].Value
+    } else {
+        throw "Provide either -Author or -Url."
+    }
+
+    # Build a simple, unambiguous format template with literal {0}
+    $baseNoQuery = "https://www.goodreads.com/author/list/$id"
+    $template    = ('{0}?page={{0}}' -f $baseNoQuery)  # -> "https://.../list/<id>?page={0}"
+    Write-Verbose "Resolved base list URL template: $template"
+    Write-Verbose ("First page URL will be: {0}" -f ($template -f 1))
+    return $template
+}
+
+# ── build base URL (accept Author name OR URL) ──────────────────────────
+$baseUrl = $null
+try {
+    if ($PSCmdlet.ParameterSetName -eq 'ByAuthor') {
+        $baseUrl = Resolve-GoodreadsAuthorListBaseUrl -Author $Author
+    } else {
+        $baseUrl = Resolve-GoodreadsAuthorListBaseUrl -Url $Url
+    }
+} catch {
+    Write-Error $_.Exception.Message
+    return
+}
+
+# ── scrape loop ─────────────────────────────────────────────────────────
 $page      = 1
 $books     = New-Object System.Collections.Generic.List[object]
 $firstHtml = (Get-Html ($baseUrl -f $page)).Content
@@ -52,7 +118,7 @@ do {
 
         if ($row -notmatch 'class="bookTitle"') { continue }
 
-        # Skip Young-Adult
+        # Skip Young-Adult rows
         if ($row -match '(?i)\bYoung Adult\b|\bYA\b') { continue }
 
         # Title
@@ -67,7 +133,7 @@ do {
         elseif ($row -match 'minirating"[^>]*>\s*([\d.]+)')             { $rating = [double]$matches[1] }
         elseif ($row -match 'itemprop="?ratingValue"?[^>]*>\s*([\d.]+)'){ $rating = [double]$matches[1] }
 
-        # Reviews / ratings
+        # Reviews / ratings (population proxy)
         $reviews = 0
         if ($row -match '([\d,]+)\s*(?:reviews|ratings)') { $reviews = Parse-Int $matches[1] }
 
@@ -75,7 +141,7 @@ do {
         $pubYear = $null
         if ($row -match 'published\s+(?:\w+\s+)?(\d{4})') { $pubYear = [int]$matches[1] }
 
-        # Series info  – capture leading numeric part only
+        # Series info – capture leading numeric part only
         $seriesName,$seriesNum = $null,$null
         $m=[regex]::Match($row,'\(([^#(]+)#\s*([\d]+(?:\.\d+)?)')
         if ($m.Success) {
@@ -87,8 +153,10 @@ do {
             if (-not [double]::IsNaN($tmp)) { $seriesNum = $tmp }
         }
 
-        # Thresholds
-        $isNF = $row -match '(?i)Nonfiction|Memoir|Biography'
+        # Coarse NF flag (we still report Category for reference)
+        $isNF = $row -match '(?i)Non[- ]?fiction|Memoir|Biography|Essays|True Crime'
+
+        # Thresholds (≥4.0 rating; ≥1,000 for fiction; ≥10,000 for NF)
         $qualifies = $rating -ge 4 -and (
                         ($isNF   -and $reviews -ge 10000) -or
                         (-not $isNF -and $reviews -ge 1000)
@@ -114,8 +182,8 @@ do {
 
 if ($ShowProgress){Write-Progress -Id 1 -Activity "Scraping" -Completed}
 
-#── compute earliest year per block (series or stand-alone) ─────────────
-$firstYear = @{}   # key = SeriesName OR Title (for stand-alone) ➜ earliest year
+# ── compute earliest year per block (series or stand-alone) ─────────────
+$firstYear = @{}
 foreach ($b in $books) {
     $key = if ($b.SeriesName) { $b.SeriesName } else { $b.Title }
     if (-not $firstYear.ContainsKey($key) -or $firstYear[$key] -gt $b.PubYear) {
@@ -125,11 +193,10 @@ foreach ($b in $books) {
 foreach ($b in $books) {
     $key = if ($b.SeriesName) { $b.SeriesName } else { $b.Title }
     $b | Add-Member -NotePropertyName BlockStartYear -NotePropertyValue $firstYear[$key]
-    # stand-alone books or missing SeriesNum => PositiveInfinity so they list after numbered parts
     if ($b.SeriesNum -eq $null) { $b | Add-Member -Force SeriesNum ([double]::PositiveInfinity) }
 }
 
-#── final multi-sort:  BlockStartYear ➜ SeriesName/Title ➜ SeriesNum ➜ Title ──
+# ── final multi-sort: BlockStartYear ➜ SeriesName/Title ➜ SeriesNum ➜ Title ──
 $sorted = $books |
 Sort-Object `
     @{Expression = 'BlockStartYear'; Ascending = $true}, `
@@ -137,7 +204,7 @@ Sort-Object `
     @{Expression = 'SeriesNum' ; Ascending = $true}, `
     @{Expression = 'Title'     ; Ascending = $true}
 
-#── table rows (formatted for console) ───────────────────────────────────
+# ── table rows (formatted for console) ──────────────────────────────────
 $tableRows = $sorted |
 Select-Object `
     @{Label='Title'      ; Expression = { $_.Title }}, `
@@ -147,7 +214,7 @@ Select-Object `
     @{Label='AvgRating'  ; Expression = { '{0:N2}' -f [double]$_.AvgRating }}, `
     @{Label='ReviewCount'; Expression = { '{0:N0}' -f [int]$_.ReviewCount }}
 
-#── CSV rows (clean numeric values) ──────────────────────────────────────
+# ── CSV rows (clean numeric values) ─────────────────────────────────────
 $csvRows = $sorted |
 Select-Object `
     @{Name='Title'      ; Expression = { $_.Title }}, `
@@ -157,10 +224,10 @@ Select-Object `
     @{Name='AvgRating'  ; Expression = { [math]::Round([double]$_.AvgRating,2) }}, `
     @{Name='ReviewCount'; Expression = { [int]$_.ReviewCount }}
 
-#── output table ─────────────────────────────────────────────────────────
+# ── output table ────────────────────────────────────────────────────────
 $tableRows | Format-Table -AutoSize -Wrap
 
-#── optional CSV export ──────────────────────────────────────────────────
+# ── optional CSV export ─────────────────────────────────────────────────
 if ($OutCsv) {
     try {
         $csvRows | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $OutCsv
