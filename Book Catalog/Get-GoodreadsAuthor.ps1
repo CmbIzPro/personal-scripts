@@ -34,7 +34,7 @@ function Get-Html {
             $norm = Normalize-Url $Url
             Write-Verbose "GET $norm (try $i)"
             return Invoke-WebRequest -Uri $norm -UseBasicParsing `
-                   -UserAgent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PowerShellScraper/1.4" `
+                   -UserAgent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PowerShellScraper/1.5" `
                    -MaximumRedirection 3 -ErrorAction Stop
         } catch {
             if ($i -eq $MaxRetry) {
@@ -82,7 +82,46 @@ function Resolve-GoodreadsAuthorListBaseUrl {
     return $template
 }
 
-# Return Title, PubYear, Genres[], and a genres-only HTML snippet (for robust YA/MG checks)
+# Extract number of pages from a Goodreads book page (only Goodreads markup)
+function Get-PageCountFromHtml {
+    param([Parameter(Mandatory)][string]$Html)
+
+    # Focus on the "Book details" region first to avoid false positives in reviews
+    $region = $Html
+    $anchor = [regex]::Match($Html, '(?i)>\s*Book\s*Details\s*<|>\s*Book\s*details\s*<|data-testid="bookDetails"')
+    if ($anchor.Success) {
+        $start = [Math]::Max(0, $anchor.Index - 500)
+        $len   = [Math]::Min(12000, $Html.Length - $start)
+        $region = $Html.Substring($start, $len)
+    } else {
+        # Keep it modest if we don't find the section; still only scan early page area
+        $region = $Html.Substring(0, [Math]::Min(15000, $Html.Length))
+    }
+
+    # Goodreads JSON-LD ("numberOfPages": "100" OR 100)
+    $m = [regex]::Match($region, '"numberOfPages"\s*:\s*"?(\d{1,5})"?', 'IgnoreCase')
+    if ($m.Success) { return [int]$m.Groups[1].Value }
+
+    # <meta itemprop="numberOfPages" content="100">
+    $m = [regex]::Match($region, '<meta[^>]+itemprop="numberOfPages"[^>]+content="(\d{1,5})"', 'IgnoreCase')
+    if ($m.Success) { return [int]$m.Groups[1].Value }
+
+    # <span itemprop="numberOfPages">100 pages</span>
+    $m = [regex]::Match($region, '<span[^>]*itemprop="numberOfPages"[^>]*>\s*(\d{1,5})\s*pages?\s*</span>', 'IgnoreCase')
+    if ($m.Success) { return [int]$m.Groups[1].Value }
+
+    # Newer UI: data-testid="pagesFormat">… 100 pages …
+    $m = [regex]::Match($region, 'data-testid="pagesFormat"[^>]*>[\s\S]{0,300}?(\d{1,5})\s*pages', 'IgnoreCase')
+    if ($m.Success) { return [int]$m.Groups[1].Value }
+
+    # Conservative fallback only inside the Book details block
+    $m = [regex]::Match($region, '(?<!\d)(\d{1,5})\s*pages\b', 'IgnoreCase')
+    if ($m.Success) { return [int]$m.Groups[1].Value }
+
+    return $null
+}
+
+# Return Title, PubYear, Genres[], GenresHtml (for YA/MG checks), Pages
 function Get-BookPageDetails {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$BookUrl)
@@ -144,7 +183,7 @@ function Get-BookPageDetails {
         if ($m.Success) { $pubYear = [int]$m.Groups[1].Value }
     }
 
-    # --- Genres + a focused genres HTML snippet ---
+    # --- Genres + a focused genres HTML snippet (used only to filter YA/MG) ---
     $genres = New-Object System.Collections.Generic.List[string]
     $genrePatterns = @(
         '<a[^>]*class="[^"]*bookPageGenreLink[^"]*"[^>]*>(?<g>[^<]+)</a>',
@@ -160,11 +199,9 @@ function Get-BookPageDetails {
         }
     }
 
-    # Try to isolate a genres block/snippet to avoid matching reviews text
     $snippet = ''
     $blk = [regex]::Match($html, '(<section[^>]*genres[^>]*>[\s\S]{0,5000}?</section>)|(<div[^>]*genres[^>]*>[\s\S]{0,5000}?</div>)', 'IgnoreCase')
     if ($blk.Success) { $snippet = $blk.Value } else {
-        # Fallback: keep only anchor tags to /genres/… areas
         $anchors = [regex]::Matches($html, '<a[^>]+href="/genres/[^"]+"[^>]*>[^<]+</a>', 'IgnoreCase')
         if ($anchors.Count -gt 0) {
             $sb = New-Object System.Text.StringBuilder
@@ -173,11 +210,15 @@ function Get-BookPageDetails {
         }
     }
 
+    # --- Pages ---
+    $pages = Get-PageCountFromHtml -Html $html
+
     return [pscustomobject]@{
         Title       = $title
         PubYear     = $pubYear
-        Genres      = $genres
-        GenresHtml  = $snippet
+        Genres      = $genres         # internal only (YA/MG filter)
+        GenresHtml  = $snippet        # internal only (YA/MG filter)
+        Pages       = $pages
     }
 }
 
@@ -315,13 +356,14 @@ if (-not $books -or $books.Count -eq 0) {
     return
 }
 
-# ── verify: fetch book page for Title/Year/Genres; exclude YA/MG + missing year ──
+# ── verify: fetch book page; exclude YA/MG + missing year; pull Pages ──
 $verified = New-Object System.Collections.Generic.List[object]
 $idx = 0
 foreach ($b in $books) {
     $idx++
     if ($ShowProgress) {
-        Write-Progress -Id 2 -Activity "Verifying on book pages" -Status $b.TitleRow -PercentComplete ([int](($idx/$($books.Count))*100))
+        $pct = [int](($idx / $books.Count) * 100)
+        Write-Progress -Id 2 -Activity "Verifying on book pages" -Status $b.TitleRow -PercentComplete $pct
     }
     try {
         $details = Get-BookPageDetails -BookUrl $b.Url
@@ -343,7 +385,7 @@ foreach ($b in $books) {
             PubYear      = $year
             SeriesName   = $b.SeriesName
             SeriesNum    = $b.SeriesNum
-            Genres       = ($details.Genres -join '; ')
+            Pages        = $details.Pages
         })
     } catch {
         # Skip on fetch/parse failure
@@ -386,9 +428,9 @@ Select-Object `
     @{Label='SeriesName' ; Expression = { $_.SeriesName }}, `
     @{Label='SeriesNum'  ; Expression = { if ([double]::IsInfinity($_.SeriesNum)) { $null } else { $_.SeriesNum } }}, `
     @{Label='PubYear'    ; Expression = { $_.PubYear }}, `
+    @{Label='Pages'      ; Expression = { $_.Pages }}, `
     @{Label='AvgRating'  ; Expression = { '{0:N2}' -f [double]$_.AvgRating }}, `
     @{Label='ReviewCount'; Expression = { '{0:N0}' -f [int]$_.ReviewCount }}, `
-    @{Label='Genres'     ; Expression = { $_.Genres }}, `
     @{Label='Url'        ; Expression = { $_.Url }}
 
 # ── CSV rows (clean numeric values) ─────────────────────────────────────
@@ -398,9 +440,9 @@ Select-Object `
     @{Name='SeriesName' ; Expression = { $_.SeriesName }}, `
     @{Name='SeriesNum'  ; Expression = { if ([double]::IsInfinity($_.SeriesNum) -or $null -eq $_.SeriesNum) { $null } else { $_.SeriesNum } }}, `
     @{Name='PubYear'    ; Expression = { $_.PubYear }}, `
+    @{Name='Pages'      ; Expression = { if ($_.Pages) { [int]$_.Pages } else { $null } }}, `
     @{Name='AvgRating'  ; Expression = { [math]::Round([double]$_.AvgRating,2) }}, `
     @{Name='ReviewCount'; Expression = { [int]$_.ReviewCount }}, `
-    @{Name='Genres'     ; Expression = { $_.Genres }}, `
     @{Name='Url'        ; Expression = { $_.Url }}
 
 # ── output table ────────────────────────────────────────────────────────
