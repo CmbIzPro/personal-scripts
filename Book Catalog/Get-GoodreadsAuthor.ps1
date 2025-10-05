@@ -29,7 +29,13 @@ function Normalize-Url {
         throw "Bad URL after normalization: '$u'"
     }
     $uri.AbsoluteUri
-}
+} # end Normalize-Url
+
+function Strip-Tags {
+    param([string]$Html)
+    if (-not $Html) { return $Html }
+    return ([regex]::Replace($Html, '<[^>]+>', '')).Trim()
+} # end Strip-Tags
 
 function Get-Html {
     param([string]$Url,[int]$MaxRetry = 3)
@@ -38,8 +44,8 @@ function Get-Html {
             $norm = Normalize-Url $Url
             Write-Verbose "GET $norm (try $i)"
             return Invoke-WebRequest -Uri $norm -UseBasicParsing `
-                   -UserAgent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PowerShellScraper/1.7" `
-                   -MaximumRedirection 3 -ErrorAction Stop
+                   -UserAgent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PowerShellScraper/1.8" `
+                   -MaximumRedirection 5 -ErrorAction Stop
         } catch {
             if ($i -eq $MaxRetry) {
                 throw "Invoke-WebRequest failed for URL '$Url' (normalized: '$norm'): $($_.Exception.Message)"
@@ -47,9 +53,9 @@ function Get-Html {
             Start-Sleep -Seconds ([math]::Pow(2,$i))
         }
     }
-}
+} # end Get-Html
 
-function Parse-Int { param([string]$s) ($s -replace '[^\d]','') -as [int] }
+function Parse-Int { param([string]$s) ($s -replace '[^\d]','') -as [int] } # end Parse-Int
 
 function Resolve-GoodreadsAuthorListBaseUrl {
     param(
@@ -79,14 +85,14 @@ function Resolve-GoodreadsAuthorListBaseUrl {
     $baseNoQuery = "https://www.goodreads.com/author/list/$id"
     $template    = ('{0}?page={{0}}' -f $baseNoQuery)  # -> "https://.../list/<id>?page={0}"
     return $template
-}
+} # end Resolve-GoodreadsAuthorListBaseUrl
 
 function Get-AuthorIdFromListTemplate {
     param([string]$Template)
     $m = [regex]::Match($Template,'/author/list/(?<id>\d+)','IgnoreCase')
     if ($m.Success) { return $m.Groups['id'].Value }
     return $null
-}
+} # end Get-AuthorIdFromListTemplate
 
 function Get-AuthorDisplayNameById {
     param([Parameter(Mandatory)][string]$AuthorId)
@@ -116,39 +122,46 @@ function Get-AuthorDisplayNameById {
     if ($m.Success) { return [System.Net.WebUtility]::HtmlDecode($m.Groups[1].Value).Trim() }
 
     return "Author $AuthorId"
-}
+} # end Get-AuthorDisplayNameById
 
-# Extract number of pages from a Goodreads book page (only Goodreads markup)
+# Extract number of pages from a Goodreads book page (scan JSON-LD first, then fallbacks)
 function Get-PageCountFromHtml {
     param([Parameter(Mandatory)][string]$Html)
 
-    $region = $Html
-    $anchor = [regex]::Match($Html, '(?i)>\s*Book\s*Details\s*<|>\s*Book\s*details\s*<|data-testid="bookDetails"')
-    if ($anchor.Success) {
-        $start = [Math]::Max(0, $anchor.Index - 500)
-        $len   = [Math]::Min(12000, $Html.Length - $start)
-        $region = $Html.Substring($start, $len)
-    } else {
-        $region = $Html.Substring(0, [Math]::Min(15000, $Html.Length))
+    # 1) JSON-LD: numberOfPages
+    $jsonMatches = [regex]::Matches($Html, '<script[^>]+type="application/ld\+json"[^>]*>(?<j>[\s\S]+?)</script>', 'IgnoreCase')
+    foreach ($jm in $jsonMatches) {
+        $j = $jm.Groups['j'].Value
+        if ($j -match '"@type"\s*:\s*"Book"') {
+            $n = [regex]::Match($j, '"numberOfPages"\s*:\s*"?(?<p>\d{1,5})"?', 'IgnoreCase')
+            if ($n.Success) { return [int]$n.Groups['p'].Value }
+        }
     }
 
-    $m = [regex]::Match($region, '"numberOfPages"\s*:\s*"?(\d{1,5})"?', 'IgnoreCase')
-    if ($m.Success) { return [int]$m.Groups[1].Value }
+    # 2) Structured markup near details/panels
+    $region = $Html
+    $anchor = [regex]::Match($Html, '(?i)>\s*Book\s*Details\s*<|>\s*Book\s*details\s*<|data-testid="bookDetails"|data-testid="pagesFormat"')
+    if ($anchor.Success) {
+        $start = [Math]::Max(0, $anchor.Index - 1200)
+        $len   = [Math]::Min(30000, $Html.Length - $start)
+        $region = $Html.Substring($start, $len)
+    }
 
-    $m = [regex]::Match($region, '<meta[^>]+itemprop="numberOfPages"[^>]+content="(\d{1,5})"', 'IgnoreCase')
-    if ($m.Success) { return [int]$m.Groups[1].Value }
+    $m = [regex]::Match($region, '<meta[^>]+itemprop="numberOfPages"[^>]+content="(?<p>\d{1,5})"', 'IgnoreCase')
+    if ($m.Success) { return [int]$m.Groups['p'].Value }
 
-    $m = [regex]::Match($region, '<span[^>]*itemprop="numberOfPages"[^>]*>\s*(\d{1,5})\s*pages?\s*</span>', 'IgnoreCase')
-    if ($m.Success) { return [int]$m.Groups[1].Value }
+    $m = [regex]::Match($region, '<span[^>]*itemprop="numberOfPages"[^>]*>\s*(?<p>\d{1,5})\s*pages?\s*</span>', 'IgnoreCase')
+    if ($m.Success) { return [int]$m.Groups['p'].Value }
 
-    $m = [regex]::Match($region, 'data-testid="pagesFormat"[^>]*>[\s\S]{0,300}?(\d{1,5})\s*pages', 'IgnoreCase')
-    if ($m.Success) { return [int]$m.Groups[1].Value }
+    $m = [regex]::Match($region, 'data-testid="pagesFormat"[^>]*>[\s\S]{0,800}?(?<p>\d{1,5})\s*pages', 'IgnoreCase,Singleline')
+    if ($m.Success) { return [int]$m.Groups['p'].Value }
 
-    $m = [regex]::Match($region, '(?<!\d)(\d{1,5})\s*pages\b', 'IgnoreCase')
-    if ($m.Success) { return [int]$m.Groups[1].Value }
+    # 3) Plain-text fallback anywhere
+    $m = [regex]::Match($Html, '(?<!\d)(?<p>\d{1,5})\s*pages\b', 'IgnoreCase')
+    if ($m.Success) { return [int]$m.Groups['p'].Value }
 
     return $null
-}
+} # end Get-PageCountFromHtml
 
 # Parse a single Goodreads book page to get Title, PubYear, Genres (for YA/MG check), and Pages
 function Get-BookPageDetails {
@@ -157,6 +170,7 @@ function Get-BookPageDetails {
 
     $html = (Get-Html $BookUrl).Content
 
+    # If we landed on a /work/, hop to canonical /book/show/
     if ($BookUrl -match '/work/') {
         $canon = [regex]::Match($html, '<link[^>]+rel="canonical"[^>]+href="(?<h>[^"]+)"','IgnoreCase')
         if ($canon.Success -and $canon.Groups['h'].Value -match '/book/show/') {
@@ -167,7 +181,7 @@ function Get-BookPageDetails {
         }
     }
 
-    # Title
+    # --- Title: prefer JSON-LD or H1; if OG is exactly/starts with 'Goodreads', ignore it entirely ---
     $title = $null
     $jsonld = [regex]::Matches($html, '<script[^>]+type="application/ld\+json"[^>]*>(?<j>[\s\S]+?)</script>', 'IgnoreCase')
     foreach ($s in $jsonld) {
@@ -180,13 +194,15 @@ function Get-BookPageDetails {
     if (-not $title) {
         $mh1 = [regex]::Match($html, '<h1[^>]*data-testid="bookTitle"[^>]*>(?<t>[\s\S]*?)</h1>', 'IgnoreCase')
         if ($mh1.Success) {
-            $title = [regex]::Replace($mh1.Groups['t'].Value, '<.*?>', '')
-            $title = [System.Net.WebUtility]::HtmlDecode($title).Trim()
+            $title = [System.Net.WebUtility]::HtmlDecode((Strip-Tags $mh1.Groups['t'].Value))
         }
     }
     if (-not $title) {
         $mog = [regex]::Match($html, '<meta[^>]+property="og:title"[^>]+content="(?<t>[^"]+)"', 'IgnoreCase')
-        if ($mog.Success) { $title = [System.Net.WebUtility]::HtmlDecode($mog.Groups['t'].Value).Trim() }
+        if ($mog.Success) {
+            $cand = [System.Net.WebUtility]::HtmlDecode($mog.Groups['t'].Value).Trim()
+            if ($cand -notmatch '^(?i)goodreads\b') { $title = $cand }
+        }
     }
 
     # Pub year
@@ -211,11 +227,12 @@ function Get-BookPageDetails {
         if ($m.Success) { $pubYear = [int]$m.Groups[1].Value }
     }
 
-    # Genres (internal only for YA/MG filter)
+    # Genres (for YA/MG filtering)
     $genres = New-Object System.Collections.Generic.List[string]
     $genrePatterns = @(
         '<a[^>]*class="[^"]*bookPageGenreLink[^"]*"[^>]*>(?<g>[^<]+)</a>',
         '<a[^>]*data-testid="bookPageGenreLink"[^>]*>(?<g>[^<]+)</a>',
+        '<a[^>]*data-testid="genreChip"[^>]*>(?<g>[^<]+)</a>',
         '<a[^>]*href="/genres/[^"]+"[^>]*>(?<g>[^<]+)</a>',
         '<a[^>]*class="[^"]*Button--tag-inline[^"]*"[^>]*>(?<g>[^<]+)</a>'
     )
@@ -227,8 +244,9 @@ function Get-BookPageDetails {
         }
     }
 
+    # Focused snippet + big haystack (help catch all variants)
     $snippet = ''
-    $blk = [regex]::Match($html, '(<section[^>]*genres[^>]*>[\s\S]{0,5000}?</section>)|(<div[^>]*genres[^>]*>[\s\S]{0,5000}?</div>)', 'IgnoreCase')
+    $blk = [regex]::Match($html, '(<section[^>]*genres[^>]*>[\s\S]{0,8000}?</section>)|(<div[^>]*genres[^>]*>[\s\S]{0,8000}?</div>)', 'IgnoreCase')
     if ($blk.Success) { $snippet = $blk.Value } else {
         $anchors = [regex]::Matches($html, '<a[^>]+href="/genres/[^"]+"[^>]*>[^<]+</a>', 'IgnoreCase')
         if ($anchors.Count -gt 0) {
@@ -240,35 +258,58 @@ function Get-BookPageDetails {
 
     $pages = Get-PageCountFromHtml -Html $html
 
+    $hayLen = [Math]::Min($html.Length, 150000)
+    $genresHaystack = ($snippet + ' ' + $html.Substring(0, $hayLen))
+
     return [pscustomobject]@{
-        Title       = $title
-        PubYear     = $pubYear
-        Genres      = $genres
-        GenresHtml  = $snippet
-        Pages       = $pages
+        Title          = $title
+        PubYear        = $pubYear
+        Genres         = $genres
+        GenresHtml     = $snippet
+        GenresHaystack = $genresHaystack
+        Pages          = $pages
     }
-}
+} # end Get-BookPageDetails
 
 function Test-IsYAOrMiddleGrade {
     param(
         [string[]]$Genres,
-        [string]$GenresHtml
+        [string]$GenresHtml,
+        [string]$FullHtml  # optional big haystack
     )
-    if (-not $Genres) { $Genres = @() }
-    if (-not $GenresHtml) { $GenresHtml = '' }
 
-    $pattern = '(?<!\w)(young[\s-]*adult|ya|middle[\s-]*grade|mg|teen(?:s)?|juvenile|children(?:''s)?|childrens)(?!\w)'
+    if (-not $Genres)    { $Genres     = @() }
+    if (-not $GenresHtml){ $GenresHtml = '' }
+    if (-not $FullHtml)  { $FullHtml   = '' }
 
+    # Word-based variants to check ONLY in extracted genre names (avoid scanning whole page text).
+    # Keep this tight to avoid false positives.
+    $wordPat = '(?i)\b(young[\s-]*adult|ya|middle[\s-]*grade|mg|teen(?:s)?|juvenile)\b'
+
+    # Children's genre with apostrophes (children's / children’s), also ONLY in genre names.
+    # Use regex escapes for apostrophes to avoid quoting issues.
+    $childAposPat = '(?i)\bchild(?:ren)?(?:(?:\x27|\u2019))s\b'
+
+    # Genre/shelf URL patterns: safe to use on the HTML haystacks.
+    $hrefPat = '(?i)/(genres|shelf/show)/(young-adult|ya|middle-grade|children|childrens|kids|juvenile|teen)\b'
+
+    # 1) Check explicit genre tags (strings)
     foreach ($g in $Genres) {
-        if ($g -and ($g.ToLowerInvariant() -match $pattern)) { return $true }
+        if (-not $g) { continue }
+        if ($g -match $wordPat)       { return $true }
+        if ($g -match $childAposPat)  { return $true }  # "Children's", "Children’s"
+        # NOTE: we intentionally do NOT match plain "children" or "kids" here to avoid false positives
     }
-    if ($GenresHtml -match $pattern -or
-        $GenresHtml -match '/genres/young-adult|/genres/middle-grade|/genres/children|/genres/childrens') {
-        return $true
-    }
+
+    # 2) Check focused genres HTML for explicit genre/shelf links
+    if ($GenresHtml -match $hrefPat) { return $true }
+
+    # 3) As a last resort, check the larger HTML only for explicit genre/shelf links (not free text)
+    if ($FullHtml -match $hrefPat)   { return $true }
 
     return $false
 }
+
 
 function Get-BooksForAuthor {
     param(
@@ -301,14 +342,20 @@ function Get-BooksForAuthor {
         foreach ($row in ($html -split '(?=<tr)')) {
             if ($row -notmatch 'class="bookTitle"') { continue }
 
-            # Title + URL
+            # --- Title + URL (robust across newlines & nested spans) ---
             $titleFromRow = ''
             $bookUrl = $null
-            $mTitle = [regex]::Match($row,'class="bookTitle"[^>]*href="(?<href>[^"]+)"[^>]*>\s*(?:<span[^>]*>)?([^<]+)','IgnoreCase')
+            $mTitle = [regex]::Match($row,'<a[^>]*class="bookTitle"[^>]*href="(?<href>[^"]+)"[^>]*>(?<inner>[\s\S]*?)</a>','IgnoreCase,Singleline')
             if ($mTitle.Success) {
-                $titleFromRow = [System.Net.WebUtility]::HtmlDecode($mTitle.Groups[2].Value.Trim())
-                $href  = $mTitle.Groups['href'].Value
+                $href = $mTitle.Groups['href'].Value
                 $bookUrl = if ($href -like 'http*') { $href } else { "https://www.goodreads.com$href" }
+                $inner = $mTitle.Groups['inner'].Value
+                $mName = [regex]::Match($inner,'<span[^>]*itemprop="name"[^>]*>(?<t>[^<]+)</span>','IgnoreCase')
+                if ($mName.Success) {
+                    $titleFromRow = [System.Net.WebUtility]::HtmlDecode($mName.Groups['t'].Value).Trim()
+                } else {
+                    $titleFromRow = [System.Net.WebUtility]::HtmlDecode((Strip-Tags $inner))
+                }
             } else { continue }
 
             # Coarse YA/MG skip (final check on book page)
@@ -386,11 +433,15 @@ function Get-BooksForAuthor {
         }
         try {
             $details = Get-BookPageDetails -BookUrl $b.Url
-            $finalTitle = if ($details.Title) { $details.Title } else { $b.TitleRow }
+
+            # Prefer parsed title unless it's a generic 'Goodreads'; otherwise use row title
+            $finalTitle = if ($details.Title -and $details.Title -notmatch '^(?i)goodreads\b') { $details.Title } else { $b.TitleRow }
             $year    = if ($b.PubYear) { $b.PubYear } else { $details.PubYear }
 
             if (-not $year) { continue }
-            if (Test-IsYAOrMiddleGrade -Genres $details.Genres -GenresHtml $details.GenresHtml) { continue }
+
+            # YA/MG test with big haystack (also checks /shelf/show/)
+            if (Test-IsYAOrMiddleGrade -Genres $details.Genres -GenresHtml $details.GenresHtml -FullHtml $details.GenresHaystack) { continue }
 
             $verified.Add([pscustomobject]@{
                 Author       = $AuthorName
@@ -428,7 +479,7 @@ function Get-BooksForAuthor {
     }
 
     return ,$verified
-}
+} # end Get-BooksForAuthor
 
 # ── gather authors/urls from parameters and CSV ─────────────────────────
 $authorsAll = @()
