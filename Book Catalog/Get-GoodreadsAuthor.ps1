@@ -156,7 +156,6 @@ function Get-CanonicalBookHtml {
 function Get-PageCountFromHtml {
     param([Parameter(Mandatory)][string]$Html)
 
-    # 0) quick guard
     if (-not $Html -or $Html.Length -lt 1000) {
         Write-Verbose "HTML too short; cannot parse pages."
         return $null
@@ -602,6 +601,28 @@ if ($all.Count -eq 0) {
     return
 }
 
+# ── NEW: compute per-author average rating across included books ────────
+$authorAvgMap = @{}
+$authorSummary = New-Object System.Collections.Generic.List[object]
+$groups = $all | Group-Object Author
+foreach ($g in $groups) {
+    $avg = $null
+    if ($g.Count -gt 0) {
+        $avg = [math]::Round((($g.Group | Measure-Object -Property AvgRating -Average).Average), 2)
+    }
+    $authorAvgMap[$g.Name] = $avg
+    $authorSummary.Add([pscustomobject]@{
+        Author    = $g.Name
+        Books     = $g.Count
+        AuthorAvg = $avg
+    }) | Out-Null
+}
+
+# Attach AuthorAvg to each row for downstream output
+foreach ($row in $all) {
+    $row | Add-Member -NotePropertyName AuthorAvg -NotePropertyValue $authorAvgMap[$row.Author] -Force
+}
+
 # ── final multi-sort: Author ➜ BlockStartYear ➜ Series/Title ➜ SeriesNum ➜ Title ──
 $sorted = $all |
 Sort-Object `
@@ -611,10 +632,15 @@ Sort-Object `
     @{Expression = 'SeriesNum'    ; Ascending = $true}, `
     @{Expression = 'Title'        ; Ascending = $true}
 
+# ── summary table (console) ────────────────────────────────────────────
+"`nPer-author average rating (across included books):`n" | Write-Host
+$authorSummary | Sort-Object Author | Format-Table -AutoSize
+
 # ── table rows (console) ────────────────────────────────────────────────
 $tableRows = $sorted |
 Select-Object `
     @{Label='Author'     ; Expression = { $_.Author }}, `
+    @{Label='AuthorAvg'  ; Expression = { if ($_.AuthorAvg -ne $null) { '{0:N2}' -f [double]$_.AuthorAvg } else { $null } }}, `
     @{Label='Title'      ; Expression = { $_.Title }}, `
     @{Label='SeriesName' ; Expression = { $_.SeriesName }}, `
     @{Label='SeriesNum'  ; Expression = { if ([double]::IsInfinity($_.SeriesNum)) { $null } else { $_.SeriesNum } }}, `
@@ -630,6 +656,7 @@ $tableRows | Format-Table -AutoSize -Wrap
 $csvRows = $sorted |
 Select-Object `
     @{Name='Author'     ; Expression = { $_.Author }}, `
+    @{Name='AuthorAvg'  ; Expression = { if ($_.AuthorAvg -ne $null) { [math]::Round([double]$_.AuthorAvg,2) } else { $null } }}, `
     @{Name='Title'      ; Expression = { $_.Title }}, `
     @{Name='SeriesName' ; Expression = { $_.SeriesName }}, `
     @{Name='SeriesNum'  ; Expression = { if ([double]::IsInfinity($_.SeriesNum) -or $null -eq $_.SeriesNum) { $null } else { $_.SeriesNum } }}, `
