@@ -136,7 +136,7 @@ function Normalize-Genre {
 # Extract number of pages (robust)
 function Get-PageCountFromHtml {
     param([Parameter(Mandatory)][string]$Html)
-    if (-not $Html -or $Html.Length -lt 1000) { Write-Verbose "HTML too short; cannot parse pages."; return $null }
+    if (-not $Html -or $Html.Length -lt 1000) { return $null }
     foreach ($j in (Get-JsonLdStrings -Html $Html)) {
         if ($j -match '"@type"\s*:\s*"Book"') {
             $n = [regex]::Match($j, '"numberOfPages"\s*:\s*"?(?<p>\d{1,5})"?', 'IgnoreCase'); if ($n.Success) { return [int]$n.Groups['p'].Value }
@@ -362,9 +362,15 @@ function Get-BooksForAuthor {
     if ($ShowProgress){ Write-Progress -Id 11 -Activity "Scraping list pages ($AuthorName)" -Status "Start" -PercentComplete 0 }
     function Update-BarLocal { param($cur,$tot,$name,$show) if($show){ $pct=if($tot){[int](($cur-1)/$tot*100)}else{0}; Write-Progress -Id 11 -Activity "Scraping list pages ($name)" -Status "Page $cur$('/'+$tot)" -PercentComplete $pct } }
 
+    $stopPaging = $false
+
     do {
         Update-BarLocal $page $totalPages $AuthorName $ShowProgress
         $html = if ($page -eq 1){$firstHtml}else{ (Get-Html ($BaseTemplate -f $page)).Content }
+
+        # Track the minimum parsed ratings count seen on THIS page.
+        $minCountOnPage = [int]::MaxValue
+        $parsedAnyCount = $false
 
         foreach ($row in ($html -split '(?=<tr)')) {
             if ($row -notmatch 'class="bookTitle"') { continue }
@@ -381,7 +387,7 @@ function Get-BooksForAuthor {
                 else { $titleFromRow = [System.Net.WebUtility]::HtmlDecode((Strip-Tags $inner)) }
             } else { continue }
 
-            # Parse hints (may be null; final values come from book page)
+            # Parse any row-level hints (we do not filter here)
             $pubYear=$null; $mYear=[regex]::Match($row,'published\s+(?:\w+\s+)?(\d{4})','IgnoreCase'); if ($mYear.Success){ $pubYear=[int]$mYear.Groups[1].Value }
             $seriesName,$seriesNum=$null,$null
             $m=[regex]::Match($row,'\(([^#(]+)#\s*([\d]+(?:\.\d+)?)')
@@ -390,6 +396,14 @@ function Get-BooksForAuthor {
                 $numString  = $m.Groups[2].Value
                 $tmp=0.0; [double]::TryParse($numString,[System.Globalization.NumberStyles]::Float,[System.Globalization.CultureInfo]::InvariantCulture,[ref]$tmp) | Out-Null
                 if (-not [double]::IsNaN($tmp)) { $seriesNum = $tmp }
+            }
+
+            # Parse ratings COUNT on the list row for early-stop heuristic
+            $mCount=[regex]::Match($row,'([\d,]+)\s*(?:ratings|reviews)','IgnoreCase')
+            if ($mCount.Success) {
+                $parsedAnyCount = $true
+                $c = Parse-Int $mCount.Groups[1].Value
+                if ($c -lt $minCountOnPage) { $minCountOnPage = $c }
             }
 
             $rawRows.Add([pscustomobject]@{
@@ -401,7 +415,13 @@ function Get-BooksForAuthor {
             })
         }
 
-        $hasNext = $html -match 'rel="next"'
+        # decide if we should stop paging AFTER this page
+        $hasNext = ($html -match 'rel="next"')
+        if ($parsedAnyCount -and $minCountOnPage -lt 1000) {
+            $stopPaging = $true
+        }
+        if ($stopPaging) { $hasNext = $false }
+
         $page++
         Start-Sleep -Milliseconds (Get-Random -Min 800 -Max 1600)
     } while ($hasNext)
