@@ -172,7 +172,7 @@ function Get-BookRatingsFromHtml {
             $ar = [regex]::Match($j, '"aggregateRating"\s*:\s*\{(?<obj>[\s\S]+?)\}', 'IgnoreCase')
             if ($ar.Success) {
                 $obj = $ar.Groups['obj'].Value
-                $mv = [regex]::Match($obj, '"(?:ratingValue|averageRating)"\s*:\s*"?(?<v>\d(?:\.\d{1,2})?)"?', 'IgnoreCase')
+                $mv = [regex]::Match($obj, '"(?:ratingValue|averageRating)"\s*:\s*"?(?<v>\d(?:\.\d{1,3})?)"?', 'IgnoreCase')
                 if ($mv.Success) { $avg = [double]$mv.Groups['v'].Value }
                 $mc = [regex]::Match($obj, '"(?:ratingCount|reviewCount)"\s*:\s*"?(?<c>[\d,]+)"?', 'IgnoreCase')
                 if ($mc.Success) { $count = Parse-Int $mc.Groups['c'].Value }
@@ -180,7 +180,7 @@ function Get-BookRatingsFromHtml {
             }
         }
         if ($j -match '"@type"\s*:\s*"AggregateRating"') {
-            $mv = [regex]::Match($j, '"(?:ratingValue|averageRating)"\s*:\s*"?(?<v>\d(?:\.\d{1,2})?)"?', 'IgnoreCase')
+            $mv = [regex]::Match($j, '"(?:ratingValue|averageRating)"\s*:\s*"?(?<v>\d(?:\.\d{1,3})?)"?', 'IgnoreCase')
             if ($mv.Success) { $avg = [double]$mv.Groups['v'].Value }
             $mc = [regex]::Match($j, '"(?:ratingCount|reviewCount)"\s*:\s*"?(?<c>[\d,]+)"?', 'IgnoreCase')
             if ($mc.Success) { $count = Parse-Int $mc.Groups['c'].Value }
@@ -204,7 +204,7 @@ function Get-BookRatingsFromHtml {
     # 3) data-testid variations (new UI)
     $dtC = [regex]::Match($Html, '<[^>]+data-testid="(?:ratingsCount|ratingCount)"[^>]*>(?<t>[^<]+)</', 'IgnoreCase')
     if ($dtC.Success) { $count = Parse-Int $dtC.Groups['t'].Value }
-    $dtV = [regex]::Match($Html, '<[^>]+data-testid="(?:rating|ratingValue)"[^>]*>\s*(?<v>\d(?:\.\d{1,2})?)\s*<', 'IgnoreCase')
+    $dtV = [regex]::Match($Html, '<[^>]+data-testid="(?:rating|ratingValue)"[^>]*>\s*(?<v>\d(?:\.\d{1,3})?)\s*<', 'IgnoreCase')
     if ($dtV.Success) { $avg = [double]$dtV.Groups['v'].Value }
     if ($avg -or $count) { return @{ AvgRating=$avg; ReviewCount=$count } }
 
@@ -213,7 +213,7 @@ function Get-BookRatingsFromHtml {
     foreach ($s in $scripts) {
         $blob = $s.Groups['s'].Value
         if ($blob -match '"aggregateRating"' -or $blob -match '"ratingsCount"') {
-            $mv = [regex]::Match($blob, '"(?:ratingValue|averageRating)"\s*:\s*"?(?<v>\d(?:\.\d{1,2})?)"?', 'IgnoreCase')
+            $mv = [regex]::Match($blob, '"(?:ratingValue|averageRating)"\s*:\s*"?(?<v>\d(?:\.\d{1,3})?)"?', 'IgnoreCase')
             if ($mv.Success) { $avg = [double]$mv.Groups['v'].Value }
             $mc = [regex]::Match($blob, '"(?:ratingCount|ratingsCount|reviewCount)"\s*:\s*"?(?<c>[\d,]+)"?', 'IgnoreCase')
             if ($mc.Success) { $count = Parse-Int $mc.Groups['c'].Value }
@@ -223,7 +223,7 @@ function Get-BookRatingsFromHtml {
 
     # 5) Cleaned text fallbacks
     $t = Clean-Text $Html
-    $m = [regex]::Match($t, '(?<v>\d\.\d{1,2})\s*avg\s*rating', 'IgnoreCase')
+    $m = [regex]::Match($t, '(?<v>\d\.\d{1,3})\s*avg\s*rating', 'IgnoreCase')
     if ($m.Success) { $avg = [double]$m.Groups['v'].Value }
     $m2 = [regex]::Match($t, '\((?<c>[\d,]+)\s+ratings\)', 'IgnoreCase')
     if ($m2.Success) { $count = Parse-Int $m2.Groups['c'].Value }
@@ -350,7 +350,8 @@ function Get-BooksForAuthor {
     param(
         [Parameter(Mandatory)][string]$BaseTemplate,
         [Parameter(Mandatory)][string]$AuthorName,
-        [string]$AuthorGenreNormalized = 'Other',
+        [string]$AuthorGenreGroup   = 'Other',  # For interleaving pattern (Fantasy / Science-Fiction / Other)
+        [string]$AuthorGenreDisplay = 'Other',  # What to display in output (raw CSV genre if not F/SF)
         [switch]$ShowProgress
     )
 
@@ -464,18 +465,19 @@ function Get-BooksForAuthor {
 
             if ($qualifies) {
                 $verified.Add([pscustomobject]@{
-                    Author       = $AuthorName
-                    AuthorGenre  = $AuthorGenreNormalized
-                    Title        = $finalTitle
-                    Url          = $b.Url
-                    Category     = if ($isNF) { 'Non-fiction' } else { 'Fiction' }
-                    AvgRating    = [math]::Round([double]$avgRating,2)
-                    ReviewCount  = [int]$reviewCount
-                    PubYear      = $year
-                    SeriesName   = $b.SeriesName
-                    SeriesNum    = $b.SeriesNum
-                    Pages        = $details.Pages
-                    AgeCategory  = $details.AgeCategory
+                    Author            = $AuthorName
+                    AuthorGenreGroup  = $AuthorGenreGroup
+                    AuthorGenre       = $AuthorGenreDisplay
+                    Title             = $finalTitle
+                    Url               = $b.Url
+                    Category          = if ($isNF) { 'Non-fiction' } else { 'Fiction' }
+                    AvgRating         = if ($avgRating -ne $null) { [math]::Round([double]$avgRating,3) } else { $null }
+                    ReviewCount       = if ($reviewCount -ne $null) { [int]$reviewCount } else { $null }
+                    PubYear           = $year
+                    SeriesName        = $b.SeriesName
+                    SeriesNum         = $b.SeriesNum
+                    Pages             = $details.Pages
+                    AgeCategory       = $details.AgeCategory
                 })
             }
         } catch { }
@@ -499,7 +501,7 @@ function Get-BooksForAuthor {
     ,$verified
 }
 
-# ── gather inputs (now capturing Genre) ─────────────────────────────────
+# ── gather inputs (capture raw & normalized genre) ──────────────────────
 $inputSpecs = New-Object System.Collections.Generic.List[pscustomobject]
 
 # From params
@@ -538,7 +540,7 @@ if ($InCsv) {
 
 if ($inputSpecs.Count -eq 0) { Write-Warning "No authors or URLs found after parsing inputs."; return }
 
-# ── build worklist (resolve templates, display names, attach Genre) ─────
+# ── build worklist (resolve templates, attach both genre forms) ─────────
 $work = New-Object System.Collections.Generic.List[pscustomobject]
 $seenTemplates = @{}
 
@@ -548,8 +550,10 @@ foreach ($spec in $inputSpecs) {
         if (-not $seenTemplates.ContainsKey($tmpl)) {
             $aid  = Get-AuthorIdFromListTemplate $tmpl
             $name = if ($aid) { Get-AuthorDisplayNameById -AuthorId $aid } else { if ($spec.Author) { $spec.Author } else { "Author from URL" } }
-            $genreNorm = Normalize-Genre $spec.Genre
-            $work.Add([pscustomobject]@{ Template=$tmpl; AuthorId=$aid; AuthorName=$name; Genre=$genreNorm })
+            $genreRaw   = $spec.Genre
+            $genreGroup = Normalize-Genre $genreRaw
+            $genreDisp  = if ($genreGroup -eq 'Other' -and $genreRaw) { $genreRaw } else { $genreGroup }
+            $work.Add([pscustomobject]@{ Template=$tmpl; AuthorId=$aid; AuthorName=$name; GenreGroup=$genreGroup; GenreDisplay=$genreDisp })
             $seenTemplates[$tmpl] = $true
         }
     } catch {
@@ -563,7 +567,7 @@ if ($work.Count -eq 0) { Write-Warning "Nothing to process after resolving autho
 # ── scrape all requested authors ────────────────────────────────────────
 $all = New-Object System.Collections.Generic.List[object]
 foreach ($w in $work) {
-    $items = Get-BooksForAuthor -BaseTemplate $w.Template -AuthorName $w.AuthorName -AuthorGenreNormalized $w.Genre -ShowProgress:$ShowProgress
+    $items = Get-BooksForAuthor -BaseTemplate $w.Template -AuthorName $w.AuthorName -AuthorGenreGroup $w.GenreGroup -AuthorGenreDisplay $w.GenreDisplay -ShowProgress:$ShowProgress
     foreach ($it in $items) { [void]$all.Add($it) }
 }
 if ($all.Count -eq 0) { Write-Warning "No books met filters across all authors."; return }
@@ -571,20 +575,24 @@ if ($all.Count -eq 0) { Write-Warning "No books met filters across all authors."
 # ── compute per-author averages and attach Genre ────────────────────────
 $authorSummary = New-Object System.Collections.Generic.List[object]
 $groups = $all | Group-Object Author
-$authorAvgMap = @{}; $authorGenreMap=@{}
+$authorAvgMap = @{}; $authorGenreMap=@{}; $authorGenreGroupMap=@{}
 
 foreach ($g in $groups) {
     $avg = $null
     $avgRaw = (($g.Group | Where-Object { $_.AvgRating -ne $null } | Measure-Object -Property AvgRating -Average).Average)
-    if ($avgRaw -is [double]) { $avg = [math]::Round($avgRaw, 2) }
-    $ag = ($g.Group | Select-Object -ExpandProperty AuthorGenre -First 1); if (-not $ag) { $ag = 'Other' }
-    $authorAvgMap[$g.Name] = $avg; $authorGenreMap[$g.Name]=$ag
-    $authorSummary.Add([pscustomobject]@{ Author=$g.Name; Genre=$ag; Books=$g.Count; AuthorAvg=$avg }) | Out-Null
+    if ($avgRaw -is [double]) { $avg = [math]::Round($avgRaw, 3) }
+    $agDisp  = ($g.Group | Select-Object -ExpandProperty AuthorGenre -First 1);        if (-not $agDisp)  { $agDisp  = 'Other' }
+    $agGroup = ($g.Group | Select-Object -ExpandProperty AuthorGenreGroup -First 1);    if (-not $agGroup) { $agGroup = 'Other' }
+    $authorAvgMap[$g.Name]        = $avg
+    $authorGenreMap[$g.Name]      = $agDisp
+    $authorGenreGroupMap[$g.Name] = $agGroup
+    $authorSummary.Add([pscustomobject]@{ Author=$g.Name; GenreDisplay=$agDisp; GenreGroup=$agGroup; Books=$g.Count; AuthorAvg=$avg }) | Out-Null
 }
 
 foreach ($row in $all) {
     $row | Add-Member -NotePropertyName AuthorAvg -NotePropertyValue $authorAvgMap[$row.Author] -Force
-    if (-not $row.PSObject.Properties.Match('AuthorGenre')) { $row | Add-Member -NotePropertyName AuthorGenre -NotePropertyValue ($authorGenreMap[$row.Author]) -Force }
+    if (-not $row.PSObject.Properties.Match('AuthorGenre'))       { $row | Add-Member -NotePropertyName AuthorGenre       -NotePropertyValue ($authorGenreMap[$row.Author]) -Force }
+    if (-not $row.PSObject.Properties.Match('AuthorGenreGroup'))  { $row | Add-Member -NotePropertyName AuthorGenreGroup  -NotePropertyValue ($authorGenreGroupMap[$row.Author]) -Force }
 }
 
 # ── build interleaved author order with arrays (no Queues) ──────────────
@@ -595,9 +603,9 @@ function Sort-ByAvgDesc {
         @{ Expression = 'Author' ; Descending = $false }
 }
 
-$fantasyList = Sort-ByAvgDesc ($authorSummary | Where-Object { $_.Genre -eq 'Fantasy' })
-$scifiList   = Sort-ByAvgDesc ($authorSummary | Where-Object { $_.Genre -eq 'Science-Fiction' })
-$otherList   = Sort-ByAvgDesc ($authorSummary | Where-Object { $_.Genre -eq 'Other' })
+$fantasyList = Sort-ByAvgDesc ($authorSummary | Where-Object { $_.GenreGroup -eq 'Fantasy' })
+$scifiList   = Sort-ByAvgDesc ($authorSummary | Where-Object { $_.GenreGroup -eq 'Science-Fiction' })
+$otherList   = Sort-ByAvgDesc ($authorSummary | Where-Object { $_.GenreGroup -eq 'Other' })
 
 # Indices into each list
 $script:fi  = 0  # Fantasy index
@@ -670,9 +678,9 @@ $authorInterleaved |
 Select-Object `
     @{l='Row'       ; e={ $_.Row }}, `
     @{l='Author'    ; e={ $_.Author }}, `
-    @{l='Genre'     ; e={ $_.Genre }}, `
+    @{l='Genre'     ; e={ $_.GenreDisplay }}, `
     @{l='Books'     ; e={ $_.Books }}, `
-    @{l='AuthorAvg' ; e={ if ($_.AuthorAvg -ne $null) { '{0:N2}' -f [double]$_.AuthorAvg } else { $null } }} |
+    @{l='AuthorAvg' ; e={ if ($_.AuthorAvg -ne $null) { '{0:N3}' -f [double]$_.AuthorAvg } else { $null } }} |
 Format-Table -AutoSize
 
 # ── DETAILED BOOK ROWS (console) ────────────────────────────────────────
@@ -680,14 +688,14 @@ $tableRows = $sorted |
 Select-Object `
     @{Label='Author'     ; Expression = { $_.Author }}, `
     @{Label='Genre'      ; Expression = { $_.AuthorGenre }}, `
-    @{Label='AuthorAvg'  ; Expression = { if ($_.AuthorAvg -ne $null) { '{0:N2}' -f [double]$_.AuthorAvg } else { $null } }}, `
+    @{Label='AuthorAvg'  ; Expression = { if ($_.AuthorAvg -ne $null) { '{0:N3}' -f [double]$_.AuthorAvg } else { $null } }}, `
     @{Label='Title'      ; Expression = { $_.Title }}, `
     @{Label='SeriesName' ; Expression = { $_.SeriesName }}, `
     @{Label='SeriesNum'  ; Expression = { if ([double]::IsInfinity($_.SeriesNum)) { $null } else { $_.SeriesNum } }}, `
     @{Label='PubYear'    ; Expression = { if ($_.PubYear -eq [int]::MaxValue) { $null } else { $_.PubYear } }}, `
     @{Label='Pages'      ; Expression = { $_.Pages }}, `
     @{Label='AgeCategory'; Expression = { $_.AgeCategory }}, `
-    @{Label='AvgRating'  ; Expression = { if ($_.AvgRating -ne $null) { '{0:N2}' -f [double]$_.AvgRating } else { $null } }}, `
+    @{Label='AvgRating'  ; Expression = { if ($_.AvgRating -ne $null) { '{0:N3}' -f [double]$_.AvgRating } else { $null } }}, `
     @{Label='ReviewCount'; Expression = { if ($_.ReviewCount -ne $null) { '{0:N0}' -f [int]$_.ReviewCount } else { $null } }}, `
     @{Label='Url'        ; Expression = { $_.Url }}
 
@@ -699,14 +707,14 @@ Select-Object `
     @{Name='Rank'       ; Expression = { $authorOrder[$_.Author] + 1 }}, `
     @{Name='Author'     ; Expression = { $_.Author }}, `
     @{Name='Genre'      ; Expression = { $_.AuthorGenre }}, `
-    @{Name='AuthorAvg'  ; Expression = { if ($_.AuthorAvg -ne $null) { [math]::Round([double]$_.AuthorAvg,2) } else { $null } }}, `
+    @{Name='AuthorAvg'  ; Expression = { if ($_.AuthorAvg -ne $null) { [math]::Round([double]$_.AuthorAvg,3) } else { $null } }}, `
     @{Name='Title'      ; Expression = { $_.Title }}, `
     @{Name='SeriesName' ; Expression = { $_.SeriesName }}, `
     @{Name='SeriesNum'  ; Expression = { if ([double]::IsInfinity($_.SeriesNum) -or $null -eq $_.SeriesNum) { $null } else { $_.SeriesNum } }}, `
     @{Name='PubYear'    ; Expression = { if ($_.PubYear -eq [int]::MaxValue) { $null } else { $_.PubYear } }}, `
     @{Name='Pages'      ; Expression = { if ($_.Pages) { [int]$_.Pages } else { $null } }}, `
     @{Name='AgeCategory'; Expression = { $_.AgeCategory }}, `
-    @{Name='AvgRating'  ; Expression = { if ($_.AvgRating -ne $null) { [math]::Round([double]$_.AvgRating,2) } else { $null } }}, `
+    @{Name='AvgRating'  ; Expression = { if ($_.AvgRating -ne $null) { [math]::Round([double]$_.AvgRating,3) } else { $null } }}, `
     @{Name='ReviewCount'; Expression = { if ($_.ReviewCount -ne $null) { [int]$_.ReviewCount } else { $null } }}, `
     @{Name='Url'        ; Expression = { $_.Url }}
 
