@@ -9,6 +9,13 @@ param(
     [string[]]$Url,
     [string]$InCsv,
 
+    # First book's Estimated Start Date (for scheduling)
+    [datetime]$FirstStartDate,
+
+    # Optional CSV of exclusions with columns (Author, Title).
+    # Titles may be full ("Mistborn (Mistborn, #1)") or plain ("Mistborn").
+    [string]$ExcludeCsv,
+
     [switch]$ShowProgress,
     [string]$OutCsv
 )
@@ -133,6 +140,17 @@ function Normalize-Genre {
     'Other'
 }
 
+# ── Title/Author normalization helpers for exclusions ───────────────────
+function Normalize-Key([string]$s){
+    if (-not $s) { return '' }
+    ($s -replace '\s+',' ' ).Trim().ToLowerInvariant()
+}
+function Simplify-Title([string]$t){
+    if (-not $t) { return '' }
+    $x = [System.Net.WebUtility]::HtmlDecode($t)
+    ($x -replace '\s*\(.*$','').Trim()
+}
+
 # Extract number of pages (robust)
 function Get-PageCountFromHtml {
     param([Parameter(Mandatory)][string]$Html)
@@ -166,7 +184,6 @@ function Get-BookRatingsFromHtml {
     param([Parameter(Mandatory)][string]$Html)
     $avg = $null; $count = $null
 
-    # 1) JSON-LD (Book ➜ aggregateRating or AggregateRating block)
     foreach ($j in (Get-JsonLdStrings -Html $Html)) {
         if ($j -match '"@type"\s*:\s*"Book"') {
             $ar = [regex]::Match($j, '"aggregateRating"\s*:\s*\{(?<obj>[\s\S]+?)\}', 'IgnoreCase')
@@ -188,7 +205,6 @@ function Get-BookRatingsFromHtml {
         }
     }
 
-    # 2) Microdata/meta itemprops
     $mV = [regex]::Match($Html, '<meta[^>]+itemprop="ratingValue"[^>]+content="(?<v>[\d.]+)"', 'IgnoreCase')
     if ($mV.Success) { $avg = [double]$mV.Groups['v'].Value }
     $mC = [regex]::Match($Html, '<meta[^>]+itemprop="ratingCount"[^>]+content="(?<c>[\d,]+)"', 'IgnoreCase')
@@ -201,14 +217,12 @@ function Get-BookRatingsFromHtml {
     if ($sC.Success) { $count = Parse-Int $sC.Groups['c'].Value }
     if ($avg -or $count) { return @{ AvgRating=$avg; ReviewCount=$count } }
 
-    # 3) data-testid variations (new UI)
     $dtC = [regex]::Match($Html, '<[^>]+data-testid="(?:ratingsCount|ratingCount)"[^>]*>(?<t>[^<]+)</', 'IgnoreCase')
     if ($dtC.Success) { $count = Parse-Int $dtC.Groups['t'].Value }
     $dtV = [regex]::Match($Html, '<[^>]+data-testid="(?:rating|ratingValue)"[^>]*>\s*(?<v>\d(?:\.\d{1,3})?)\s*<', 'IgnoreCase')
     if ($dtV.Success) { $avg = [double]$dtV.Groups['v'].Value }
     if ($avg -or $count) { return @{ AvgRating=$avg; ReviewCount=$count } }
 
-    # 4) Script blobs with aggregateRating or initial state
     $scripts = [regex]::Matches($Html, '<script[^>]*>(?<s>[\s\S]*?)</script>', 'IgnoreCase')
     foreach ($s in $scripts) {
         $blob = $s.Groups['s'].Value
@@ -221,7 +235,6 @@ function Get-BookRatingsFromHtml {
         }
     }
 
-    # 5) Cleaned text fallbacks
     $t = Clean-Text $Html
     $m = [regex]::Match($t, '(?<v>\d\.\d{1,3})\s*avg\s*rating', 'IgnoreCase')
     if ($m.Success) { $avg = [double]$m.Groups['v'].Value }
@@ -232,7 +245,7 @@ function Get-BookRatingsFromHtml {
     return @{ AvgRating=$null; ReviewCount=$null }
 }
 
-# Detect age category tags: Young Adult / Middle Grade / Children (may return multiple, '; '-joined)
+# Detect age category tags: Young Adult / Middle Grade / Children
 function Get-AgeCategory {
     param(
         [string[]]$Genres,
@@ -245,7 +258,6 @@ function Get-AgeCategory {
 
     $cats = New-Object System.Collections.Generic.HashSet[string] ([System.StringComparer]::OrdinalIgnoreCase)
 
-    # Word-based (safe in genre labels)
     foreach ($g in $Genres) {
         $gl = $g.ToLowerInvariant()
         if ($gl -match '\byoung[\s-]*adult\b' -or $gl -match '\bya\b') { [void]$cats.Add('Young Adult') }
@@ -253,7 +265,6 @@ function Get-AgeCategory {
         if ($gl -match '\bchildren(?:\x27|\u2019)?s\b' -or $gl -match '\bchildrens\b' -or $gl -match '\bkids\b') { [void]$cats.Add('Children') }
     }
 
-    # Link-based (safe in HTML haystacks)
     foreach ($hay in @($GenresHtml,$FullHtml)) {
         if ($hay -match '(?i)/(genres|shelf/show)/(young-adult|ya)\b') { [void]$cats.Add('Young Adult') }
         if ($hay -match '(?i)/(genres|shelf/show)/middle-grade\b')     { [void]$cats.Add('Middle Grade') }
@@ -261,7 +272,6 @@ function Get-AgeCategory {
     }
 
     if ($cats.Count -eq 0) { return $null }
-    # stable ordering
     $order = @('Children','Middle Grade','Young Adult')
     ($order | Where-Object { $cats.Contains($_) }) -join '; '
 }
@@ -306,14 +316,14 @@ function Get-BookPageDetails {
         $m = [regex]::Match($html, '(?:First\s+)?Published[^0-9]{0,30}(\d{4})', 'IgnoreCase'); if ($m.Success) { $pubYear = [int]$m.Groups[1].Value }
     }
 
-    # Genres (for age-category detection and info)
+    # Genres
     $genres = New-Object System.Collections.Generic.List[string]
     $genrePatterns = @(
-        '<a[^>]*class="[^"]*bookPageGenreLink[^"]*"[^>]*>(?<g>[^<]+)</a>',
-        '<a[^>]*data-testid="bookPageGenreLink"[^>]*>(?<g>[^<]+)</a>',
-        '<a[^>]*data-testid="genreChip"[^>]*>(?<g>[^<]+)</a>',
-        '<a[^>]*href="/genres/[^"]+"[^>]*>(?<g>[^<]+)</a>',
-        '<a[^>]*class="[^"]*Button--tag-inline[^"]*"[^>]*>(?<g>[^<]+)</a>'
+    '<a[^>]*class="[^"]*bookPageGenreLink[^"]*"[^>]*>(?<g>[^<]+)</a>',
+    '<a[^>]*data-testid="bookPageGenreLink"[^>]*>(?<g>[^<]+)</a>',
+    '<a[^>]*data-testid="genreChip"[^>]*>(?<g>[^<]+)</a>',
+    '<a[^>]*href="/genres/[^"]+"[^>]*>(?<g>[^<]+)</a>',
+    '<a[^>]*class="[^"]*Button--tag-inline[^"]*"[^>]*>(?<g>[^<]+)</a>'
     )
     foreach ($pat in $genrePatterns) {
         $ms = [regex]::Matches($html, $pat, 'Singleline,IgnoreCase')
@@ -352,10 +362,11 @@ function Get-BooksForAuthor {
         [Parameter(Mandatory)][string]$AuthorName,
         [string]$AuthorGenreGroup   = 'Other',  # For interleaving pattern (Fantasy / Science-Fiction / Other)
         [string]$AuthorGenreDisplay = 'Other',  # What to display in output (raw CSV genre if not F/SF)
+        [hashtable]$ExclusionMap,               # authorKey -> HashSet(normalized titles)
         [switch]$ShowProgress
     )
 
-    # ── scrape list pages (NO numeric prefilter; collect everything) ─────
+    # ── scrape list pages (collect everything; early-stop by page if min ratings < 1000) ─
     $page=1; $rawRows=New-Object System.Collections.Generic.List[object]
     $firstHtml=(Get-Html ($BaseTemplate -f $page)).Content
     $totalPages= if ($firstHtml -match 'page\s+\d+\s+of\s+(\d+)'){[int]$matches[1]}else{$null}
@@ -369,7 +380,6 @@ function Get-BooksForAuthor {
         Update-BarLocal $page $totalPages $AuthorName $ShowProgress
         $html = if ($page -eq 1){$firstHtml}else{ (Get-Html ($BaseTemplate -f $page)).Content }
 
-        # Track the minimum parsed ratings count seen on THIS page.
         $minCountOnPage = [int]::MaxValue
         $parsedAnyCount = $false
 
@@ -388,7 +398,7 @@ function Get-BooksForAuthor {
                 else { $titleFromRow = [System.Net.WebUtility]::HtmlDecode((Strip-Tags $inner)) }
             } else { continue }
 
-            # Parse any row-level hints (we do not filter here)
+            # Row-level hints
             $pubYear=$null; $mYear=[regex]::Match($row,'published\s+(?:\w+\s+)?(\d{4})','IgnoreCase'); if ($mYear.Success){ $pubYear=[int]$mYear.Groups[1].Value }
             $seriesName,$seriesNum=$null,$null
             $m=[regex]::Match($row,'\(([^#(]+)#\s*([\d]+(?:\.\d+)?)')
@@ -399,7 +409,7 @@ function Get-BooksForAuthor {
                 if (-not [double]::IsNaN($tmp)) { $seriesNum = $tmp }
             }
 
-            # Parse ratings COUNT on the list row for early-stop heuristic
+            # page-level early stop metric
             $mCount=[regex]::Match($row,'([\d,]+)\s*(?:ratings|reviews)','IgnoreCase')
             if ($mCount.Success) {
                 $parsedAnyCount = $true
@@ -416,11 +426,8 @@ function Get-BooksForAuthor {
             })
         }
 
-        # decide if we should stop paging AFTER this page
         $hasNext = ($html -match 'rel="next"')
-        if ($parsedAnyCount -and $minCountOnPage -lt 1000) {
-            $stopPaging = $true
-        }
+        if ($parsedAnyCount -and $minCountOnPage -lt 1000) { $stopPaging = $true }
         if ($stopPaging) { $hasNext = $false }
 
         $page++
@@ -434,71 +441,72 @@ function Get-BooksForAuthor {
         return @()
     }
 
-    # ── verify: fetch book pages; compute details; APPLY thresholds here ─
-    $verified = New-Object System.Collections.Generic.List[object]
+    $authorKey = Normalize-Key $AuthorName
+    $titleBanSet = $null
+    if ($ExclusionMap -and $ExclusionMap.ContainsKey($authorKey)) { $titleBanSet = $ExclusionMap[$authorKey] }
+
+    # ── fetch book pages; keep ALL (post-exclusion) for later series/standalone gating ─
+    $collected = New-Object System.Collections.Generic.List[object]
     $idx=0
     foreach ($b in $rawRows) {
-        $idx++; if ($ShowProgress) { $pct=[int](($idx/$rawRows.Count)*100); Write-Progress -Id 12 -Activity "Verifying book pages ($AuthorName)" -Status $b.TitleRow -PercentComplete $pct }
+        $idx++; if ($ShowProgress) { $pct=[int](($idx/$rawRows.Count)*100); Write-Progress -Id 12 -Activity "Fetching book pages ($AuthorName)" -Status $b.TitleRow -PercentComplete $pct }
         try {
             $details = Get-BookPageDetails -BookUrl $b.Url
-
             $finalTitle = if ($details.Title -and $details.Title -notmatch '^(?i)goodreads\b') { $details.Title } else { $b.TitleRow }
-            $year = if ($details.PubYear) { $details.PubYear } else { $b.PubYear }
-            if (-not $year) { $year = [int]::MaxValue } # keep unknown year, sort last
 
-            # Determine Non-fiction via genres haystack
+            # Apply exclusions (full & simplified title)
+            $excluded = $false
+            if ($titleBanSet) {
+                $tFull   = Normalize-Key $finalTitle
+                $tSimple = Normalize-Key (Simplify-Title $finalTitle)
+                if ($titleBanSet.Contains($tFull) -or $titleBanSet.Contains($tSimple)) { $excluded = $true }
+            }
+            if ($excluded) { continue }
+
+            $year = if ($details.PubYear) { $details.PubYear } else { $b.PubYear }
+            if (-not $year) { $year = [int]::MaxValue }
+
+            # Category label (not used in thresholds)
             $isNF = $false
             if ($details.Genres -contains 'Nonfiction' -or $details.GenresHaystack -match '(?i)\bnon[- ]?fiction\b') { $isNF = $true }
 
-            # Ratings from the book page
-            $avgRating   = $details.AvgRating
+            $avgRating   = if ($details.AvgRating -ne $null) { [math]::Round([double]$details.AvgRating,3) } else { $null }
             $reviewCount = $details.ReviewCount
 
-            # Apply thresholds: keep only strong titles
-            $qualifies = $false
-            if ($avgRating -ne $null -and $reviewCount -ne $null) {
-                $qualifies = ($avgRating -ge 4.0 -and (
-                    ($isNF   -and $reviewCount -ge 10000) -or
-                    (-not $isNF -and $reviewCount -ge 1000)
-                ))
-            }
-
-            if ($qualifies) {
-                $verified.Add([pscustomobject]@{
-                    Author            = $AuthorName
-                    AuthorGenreGroup  = $AuthorGenreGroup
-                    AuthorGenre       = $AuthorGenreDisplay
-                    Title             = $finalTitle
-                    Url               = $b.Url
-                    Category          = if ($isNF) { 'Non-fiction' } else { 'Fiction' }
-                    AvgRating         = if ($avgRating -ne $null) { [math]::Round([double]$avgRating,3) } else { $null }
-                    ReviewCount       = if ($reviewCount -ne $null) { [int]$reviewCount } else { $null }
-                    PubYear           = $year
-                    SeriesName        = $b.SeriesName
-                    SeriesNum         = $b.SeriesNum
-                    Pages             = $details.Pages
-                    AgeCategory       = $details.AgeCategory
-                })
-            }
+            $collected.Add([pscustomobject]@{
+                Author            = $AuthorName
+                AuthorGenreGroup  = $AuthorGenreGroup
+                AuthorGenre       = $AuthorGenreDisplay
+                Title             = $finalTitle
+                Url               = $b.Url
+                Category          = if ($isNF) { 'Non-fiction' } else { 'Fiction' }
+                AvgRating         = $avgRating
+                ReviewCount       = if ($reviewCount -ne $null) { [int]$reviewCount } else { $null }
+                PubYear           = $year
+                SeriesName        = $b.SeriesName
+                SeriesNum         = $b.SeriesNum
+                Pages             = $details.Pages
+                AgeCategory       = $details.AgeCategory
+            })
         } catch { }
         Start-Sleep -Milliseconds (Get-Random -Min 800 -Max 1600)
     }
-    if ($ShowProgress) { Write-Progress -Id 12 -Activity "Verifying book pages ($AuthorName)" -Completed }
-    if ($verified.Count -eq 0) { return @() }
+    if ($ShowProgress) { Write-Progress -Id 12 -Activity "Fetching book pages ($AuthorName)" -Completed }
+    if ($collected.Count -eq 0) { return @() }
 
     # ── compute earliest year per block (series or stand-alone) ─────────
     $firstYear=@{}
-    foreach ($b in $verified) {
+    foreach ($b in $collected) {
         $key = if ($b.SeriesName) { "$AuthorName|$($b.SeriesName)" } else { "$AuthorName|$($b.Title)" }
         if (-not $firstYear.ContainsKey($key) -or $firstYear[$key] -gt $b.PubYear) { $firstYear[$key]=$b.PubYear }
     }
-    foreach ($b in $verified) {
+    foreach ($b in $collected) {
         $key = if ($b.SeriesName) { "$AuthorName|$($b.SeriesName)" } else { "$AuthorName|$($b.Title)" }
         $b | Add-Member -NotePropertyName BlockStartYear -NotePropertyValue $firstYear[$key]
-        if ($b.SeriesNum -eq $null) { $b | Add-Member -Force SeriesNum ([double]::PositiveInfinity) }
+        if ($b.SeriesName -and $b.SeriesNum -eq $null) { } else { if (-not $b.SeriesName) { $b | Add-Member -Force SeriesNum ([double]::PositiveInfinity) } }
     }
 
-    ,$verified
+    ,$collected
 }
 
 # ── gather inputs (capture raw & normalized genre) ──────────────────────
@@ -512,11 +520,9 @@ if ($Url)    { foreach($u in $Url)   { if ($u) { $inputSpecs.Add([pscustomobject
 if ($InCsv) {
     try { $rows = Import-Csv -Path $InCsv } catch { Write-Error "Failed to read CSV '$InCsv': $($_.Exception.Message)"; return }
     foreach ($row in $rows) {
-        # Flexible genre column detection
         $genreProp = ($row.PSObject.Properties.Name | Where-Object { $_ -match '^(?i)(genre|genres|category|categories)$' } | Select-Object -First 1)
         $genreVal  = if ($genreProp) { $row.$genreProp } else { $null }
 
-        # Author-like fields
         $authorFields = @('Author','Authors','Name')
         foreach ($f in $authorFields) {
             if ($row.PSObject.Properties.Name -contains $f -and $row.$f) {
@@ -526,7 +532,6 @@ if ($InCsv) {
             }
         }
 
-        # URL-like fields
         $urlFields = @('Url','URL','ListUrl','AuthorUrl','AuthorURL')
         foreach ($f in $urlFields) {
             if ($row.PSObject.Properties.Name -contains $f -and $row.$f) {
@@ -539,6 +544,32 @@ if ($InCsv) {
 }
 
 if ($inputSpecs.Count -eq 0) { Write-Warning "No authors or URLs found after parsing inputs."; return }
+
+# ── build exclusion map (author -> set of titles) ───────────────────────
+$exclusionMap = @{}
+if ($ExcludeCsv) {
+    try {
+        $exRows = Import-Csv -Path $ExcludeCsv
+        foreach ($r in $exRows) {
+            $aProp = ($r.PSObject.Properties.Name | Where-Object { $_ -match '^(?i)(author|authors|name)$' } | Select-Object -First 1)
+            $tProp = ($r.PSObject.Properties.Name | Where-Object { $_ -match '^(?i)(title|book|booktitle)$' } | Select-Object -First 1)
+            if (-not $aProp -or -not $tProp) { continue }
+            $aName = [string]$r.$aProp
+            $title = [string]$r.$tProp
+            if (-not $aName -or -not $title) { continue }
+
+            $aKey = Normalize-Key $aName
+            if (-not $exclusionMap.ContainsKey($aKey)) {
+                $exclusionMap[$aKey] = New-Object System.Collections.Generic.HashSet[string] ([System.StringComparer]::OrdinalIgnoreCase)
+            }
+            $set = $exclusionMap[$aKey]
+            [void]$set.Add((Normalize-Key $title))
+            [void]$set.Add((Normalize-Key (Simplify-Title $title)))
+        }
+    } catch {
+        Write-Warning "Failed to read exclusion CSV '$ExcludeCsv': $($_.Exception.Message)"
+    }
+}
 
 # ── build worklist (resolve templates, attach both genre forms) ─────────
 $work = New-Object System.Collections.Generic.List[pscustomobject]
@@ -567,14 +598,62 @@ if ($work.Count -eq 0) { Write-Warning "Nothing to process after resolving autho
 # ── scrape all requested authors ────────────────────────────────────────
 $all = New-Object System.Collections.Generic.List[object]
 foreach ($w in $work) {
-    $items = Get-BooksForAuthor -BaseTemplate $w.Template -AuthorName $w.AuthorName -AuthorGenreGroup $w.GenreGroup -AuthorGenreDisplay $w.GenreDisplay -ShowProgress:$ShowProgress
+    $items = Get-BooksForAuthor -BaseTemplate $w.Template -AuthorName $w.AuthorName -AuthorGenreGroup $w.GenreGroup -AuthorGenreDisplay $w.GenreDisplay -ExclusionMap $exclusionMap -ShowProgress:$ShowProgress
     foreach ($it in $items) { [void]$all.Add($it) }
 }
-if ($all.Count -eq 0) { Write-Warning "No books met filters across all authors."; return }
+if ($all.Count -eq 0) { Write-Warning "No books fetched across all authors."; return }
+
+# ── SERIES/STANDALONE GATING (your algorithm) ───────────────────────────
+
+# Build series avg + first-book review-count maps
+$seriesInfo = @{}
+$seriesGroups = $all | Where-Object { $_.SeriesName } |
+    Group-Object { "{0}|{1}" -f $_.Author, $_.SeriesName }
+
+foreach ($g in $seriesGroups) {
+    $avgRaw = (($g.Group | Where-Object { $_.AvgRating -ne $null } | Measure-Object -Property AvgRating -Average).Average)
+    $avg = if ($avgRaw -is [double]) { [math]::Round([double]$avgRaw,3) } else { $null }
+
+    # Find "first book": prefer smallest numeric SeriesNum; fallback to earliest PubYear
+    $withNum = $g.Group | Where-Object { $_.SeriesNum -ne $null -and -not [double]::IsInfinity($_.SeriesNum) }
+    $first = if ($withNum.Count -gt 0) {
+        $withNum | Sort-Object @{e='SeriesNum'; Ascending=$true}, @{e='PubYear'; Ascending=$true} | Select-Object -First 1
+    } else {
+        $g.Group | Sort-Object @{e='PubYear'; Ascending=$true}, @{e='Title'; Ascending=$true} | Select-Object -First 1
+    }
+
+    $firstRC = if ($first.ReviewCount -ne $null) { [int]$first.ReviewCount } else { 0 }
+    $qualify = ($avg -ne $null -and $avg -ge 4.0 -and $firstRC -ge 1000)
+
+    $seriesInfo[$g.Name] = [pscustomobject]@{
+        SeriesAvg = $avg
+        FirstReviews = $firstRC
+        Qualifies = $qualify
+    }
+}
+
+# Filter into final list
+$final = New-Object System.Collections.Generic.List[object]
+foreach ($row in $all) {
+    if ($row.SeriesName) {
+        $key = "{0}|{1}" -f $row.Author, $row.SeriesName
+        if ($seriesInfo.ContainsKey($key) -and $seriesInfo[$key].Qualifies) {
+            $row | Add-Member -NotePropertyName SeriesAvgRating -NotePropertyValue $seriesInfo[$key].SeriesAvg -Force
+            [void]$final.Add($row)
+        }
+    } else {
+        if ($row.AvgRating -ne $null -and $row.AvgRating -ge 4.0 -and $row.ReviewCount -ne $null -and $row.ReviewCount -ge 1000) {
+            $row | Add-Member -NotePropertyName SeriesAvgRating -NotePropertyValue $null -Force
+            [void]$final.Add($row)
+        }
+    }
+}
+
+if ($final.Count -eq 0) { Write-Warning "No books passed the series/standalone gate."; return }
 
 # ── compute per-author averages and attach Genre ────────────────────────
 $authorSummary = New-Object System.Collections.Generic.List[object]
-$groups = $all | Group-Object Author
+$groups = $final | Group-Object Author
 $authorAvgMap = @{}; $authorGenreMap=@{}; $authorGenreGroupMap=@{}
 
 foreach ($g in $groups) {
@@ -589,13 +668,13 @@ foreach ($g in $groups) {
     $authorSummary.Add([pscustomobject]@{ Author=$g.Name; GenreDisplay=$agDisp; GenreGroup=$agGroup; Books=$g.Count; AuthorAvg=$avg }) | Out-Null
 }
 
-foreach ($row in $all) {
+foreach ($row in $final) {
     $row | Add-Member -NotePropertyName AuthorAvg -NotePropertyValue $authorAvgMap[$row.Author] -Force
     if (-not $row.PSObject.Properties.Match('AuthorGenre'))       { $row | Add-Member -NotePropertyName AuthorGenre       -NotePropertyValue ($authorGenreMap[$row.Author]) -Force }
     if (-not $row.PSObject.Properties.Match('AuthorGenreGroup'))  { $row | Add-Member -NotePropertyName AuthorGenreGroup  -NotePropertyValue ($authorGenreGroupMap[$row.Author]) -Force }
 }
 
-# ── build interleaved author order with arrays (no Queues) ──────────────
+# ── build interleaved author order with arrays ──────────────────────────
 function Sort-ByAvgDesc {
     param($seq)
     $seq | Sort-Object `
@@ -607,36 +686,25 @@ $fantasyList = Sort-ByAvgDesc ($authorSummary | Where-Object { $_.GenreGroup -eq
 $scifiList   = Sort-ByAvgDesc ($authorSummary | Where-Object { $_.GenreGroup -eq 'Science-Fiction' })
 $otherList   = Sort-ByAvgDesc ($authorSummary | Where-Object { $_.GenreGroup -eq 'Other' })
 
-# Indices into each list
-$script:fi  = 0  # Fantasy index
-$script:sfi = 0  # Science-Fiction index
-$script:oi  = 0  # Other index
+$script:fi  = 0
+$script:sfi = 0
+$script:oi  = 0
 
 function Take-FromGenre {
     param([ValidateSet('Fantasy','Science-Fiction','Other')] [string]$Genre)
     switch ($Genre) {
         'Fantasy' {
-            if ($script:fi -lt $fantasyList.Count) {
-                $item = $fantasyList[$script:fi]; $script:fi++
-                return $item
-            }
+            if ($script:fi -lt $fantasyList.Count) { $item = $fantasyList[$script:fi]; $script:fi++; return $item }
         }
         'Science-Fiction' {
-            if ($script:sfi -lt $scifiList.Count) {
-                $item = $scifiList[$script:sfi]; $script:sfi++
-                return $item
-            }
+            if ($script:sfi -lt $scifiList.Count) { $item = $scifiList[$script:sfi]; $script:sfi++; return $item }
         }
         'Other' {
-            if ($script:oi -lt $otherList.Count) {
-                $item = $otherList[$script:oi]; $script:oi++
-                return $item
-            }
+            if ($script:oi -lt $otherList.Count) { $item = $otherList[$script:oi]; $script:oi++; return $item }
         }
     }
     return $null
 }
-
 function Take-Any {
     $x = Take-FromGenre 'Fantasy'         ; if ($x) { return $x }
     $x = Take-FromGenre 'Science-Fiction' ; if ($x) { return $x }
@@ -644,7 +712,7 @@ function Take-Any {
     return $null
 }
 
-$pattern = @('Fantasy','Science-Fiction','Fantasy','Other')  # rows: 1=F,2=SF,3=F,4=Other, repeat
+$pattern = @('Fantasy','Science-Fiction','Fantasy','Other')
 $authorInterleaved = New-Object System.Collections.Generic.List[object]
 $idx = 0
 
@@ -656,14 +724,12 @@ while ($script:fi -lt $fantasyList.Count -or $script:sfi -lt $scifiList.Count -o
     $idx++
 }
 
-# Add 1-based row numbers for display
 for ($i=0; $i -lt $authorInterleaved.Count; $i++) { $authorInterleaved[$i] | Add-Member -NotePropertyName Row -NotePropertyValue ($i+1) -Force }
 
-# Map author to interleaved index
 $authorOrder = @{}; for ($i=0; $i -lt $authorInterleaved.Count; $i++) { $authorOrder[$authorInterleaved[$i].Author] = $i }
 
-# ── final sort for detailed book rows: interleaved authors; blocks by earliest year; series grouped; within series by number; then year/title ─
-$sorted = $all |
+# ── final sort for detailed book rows ───────────────────────────────────
+$sorted = $final |
 Sort-Object `
     @{Expression = { $authorOrder[$_.Author] } ; Ascending = $true}, `
     @{Expression = 'BlockStartYear'            ; Ascending = $true}, `
@@ -671,6 +737,84 @@ Sort-Object `
     @{Expression = 'SeriesNum'                 ; Ascending = $true}, `
     @{Expression = 'PubYear'                   ; Ascending = $true}, `
     @{Expression = 'Title'                     ; Ascending = $true}
+
+# ── reading schedule helpers ────────────────────────────────────────────
+function Test-IsReadingDay([datetime]$d){
+    # Reading days: Sunday (0) through Thursday (4)
+    return ($d.DayOfWeek -in @([System.DayOfWeek]::Sunday,[System.DayOfWeek]::Monday,[System.DayOfWeek]::Tuesday,[System.DayOfWeek]::Wednesday,[System.DayOfWeek]::Thursday))
+}
+function Get-FirstReadingDayOnOrAfter([datetime]$d){
+    $x = $d
+    while (-not (Test-IsReadingDay $x)) { $x = $x.AddDays(1) }
+    return $x
+}
+function Get-CompletionDate([datetime]$start,[int]$pages){
+    if ($pages -le 0) { return $null }
+    $readDays = [math]::Ceiling($pages / 20.0)
+    $d = Get-FirstReadingDayOnOrAfter $start
+    $remaining = $readDays - 1  # consume the starting reading day
+    while ($remaining -gt 0) {
+        $d = $d.AddDays(1)
+        if (Test-IsReadingDay $d) { $remaining-- }
+    }
+    return $d
+}
+# Start the next book on the **second Sunday** after the previous completion date
+function Get-SecondSundayAfter([datetime]$date){
+    $dow = [int]$date.DayOfWeek
+    $sunday = [int][System.DayOfWeek]::Sunday
+    $daysAhead = ($sunday - $dow + 7) % 7
+    if ($daysAhead -eq 0) { $daysAhead = 7 }     # strictly after
+    $nextSunday = $date.AddDays($daysAhead)
+    return $nextSunday.AddDays(7)                # second Sunday after
+}
+
+# ── compute schedule columns (Estimated Start/Completion) ───────────────
+foreach ($row in $sorted) {
+    $row | Add-Member -NotePropertyName EstimatedStartDate      -NotePropertyValue $null -Force
+    $row | Add-Member -NotePropertyName EstimatedCompletionDate -NotePropertyValue $null -Force
+}
+
+# cutoff: stop populating once a book's Estimated Completion enters (RunYear + 2)
+$runYear    = (Get-Date).Year
+$cutoffYear = $runYear + 2
+
+if ($FirstStartDate) {
+    $prevCompletion = $null
+    $firstAssigned = $false
+    $stopScheduling = $false
+
+    foreach ($row in $sorted) {
+        if ($stopScheduling) { continue }
+
+        if ($row.Pages -and [int]$row.Pages -gt 0) {
+            $estStart = $null
+            if (-not $firstAssigned) {
+                $estStart = [datetime]$FirstStartDate
+                $firstAssigned = $true
+            } elseif ($prevCompletion) {
+                $estStart = Get-SecondSundayAfter -date $prevCompletion
+            } else {
+                $estStart = [datetime]$FirstStartDate
+            }
+
+            $estCompletion = Get-CompletionDate -start $estStart -pages ([int]$row.Pages)
+
+            # If the completion reaches the cutoff year (e.g., 2027 when running in 2025),
+            # do not populate this book or any following books.
+            if ($estCompletion -and $estCompletion.Year -ge $cutoffYear) {
+                $stopScheduling = $true
+                continue
+            }
+
+            $row.EstimatedStartDate      = $estStart
+            $row.EstimatedCompletionDate = $estCompletion
+            $prevCompletion = $estCompletion
+        }
+    }
+} elseif ($PSBoundParameters.ContainsKey('FirstStartDate')) {
+    Write-Warning "FirstStartDate was provided but empty; schedule columns will be blank."
+}
 
 # ── AUTHOR RANKING (interleaved) ────────────────────────────────────────
 "`nAuthor ranking (pattern: Row 1 F, 2 SF, 3 F, 4 Other; then repeat):`n" | Write-Host
@@ -692,11 +836,14 @@ Select-Object `
     @{Label='Title'      ; Expression = { $_.Title }}, `
     @{Label='SeriesName' ; Expression = { $_.SeriesName }}, `
     @{Label='SeriesNum'  ; Expression = { if ([double]::IsInfinity($_.SeriesNum)) { $null } else { $_.SeriesNum } }}, `
+    @{Label='SeriesAvg'  ; Expression = { if ($_.SeriesAvgRating -ne $null) { '{0:N3}' -f [double]$_.SeriesAvgRating } else { $null } }}, `
     @{Label='PubYear'    ; Expression = { if ($_.PubYear -eq [int]::MaxValue) { $null } else { $_.PubYear } }}, `
     @{Label='Pages'      ; Expression = { $_.Pages }}, `
     @{Label='AgeCategory'; Expression = { $_.AgeCategory }}, `
     @{Label='AvgRating'  ; Expression = { if ($_.AvgRating -ne $null) { '{0:N3}' -f [double]$_.AvgRating } else { $null } }}, `
     @{Label='ReviewCount'; Expression = { if ($_.ReviewCount -ne $null) { '{0:N0}' -f [int]$_.ReviewCount } else { $null } }}, `
+    @{Label='EstStart'   ; Expression = { if ($_.EstimatedStartDate) { $_.EstimatedStartDate.ToString('yyyy-MM-dd') } else { $null } }}, `
+    @{Label='EstComplete'; Expression = { if ($_.EstimatedCompletionDate) { $_.EstimatedCompletionDate.ToString('yyyy-MM-dd') } else { $null } }}, `
     @{Label='Url'        ; Expression = { $_.Url }}
 
 $tableRows | Format-Table -AutoSize -Wrap
@@ -711,11 +858,14 @@ Select-Object `
     @{Name='Title'      ; Expression = { $_.Title }}, `
     @{Name='SeriesName' ; Expression = { $_.SeriesName }}, `
     @{Name='SeriesNum'  ; Expression = { if ([double]::IsInfinity($_.SeriesNum) -or $null -eq $_.SeriesNum) { $null } else { $_.SeriesNum } }}, `
+    @{Name='SeriesAvg'  ; Expression = { if ($_.SeriesAvgRating -ne $null) { [math]::Round([double]$_.SeriesAvgRating,3) } else { $null } }}, `
     @{Name='PubYear'    ; Expression = { if ($_.PubYear -eq [int]::MaxValue) { $null } else { $_.PubYear } }}, `
     @{Name='Pages'      ; Expression = { if ($_.Pages) { [int]$_.Pages } else { $null } }}, `
     @{Name='AgeCategory'; Expression = { $_.AgeCategory }}, `
     @{Name='AvgRating'  ; Expression = { if ($_.AvgRating -ne $null) { [math]::Round([double]$_.AvgRating,3) } else { $null } }}, `
     @{Name='ReviewCount'; Expression = { if ($_.ReviewCount -ne $null) { [int]$_.ReviewCount } else { $null } }}, `
+    @{Name='EstimatedStartDate'     ; Expression = { if ($_.EstimatedStartDate) { $_.EstimatedStartDate.ToString('yyyy-MM-dd') } else { $null } }}, `
+    @{Name='EstimatedCompletionDate'; Expression = { if ($_.EstimatedCompletionDate) { $_.EstimatedCompletionDate.ToString('yyyy-MM-dd') } else { $null } }}, `
     @{Name='Url'        ; Expression = { $_.Url }}
 
 if ($OutCsv) {
