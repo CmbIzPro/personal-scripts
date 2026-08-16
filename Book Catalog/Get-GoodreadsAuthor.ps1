@@ -1,880 +1,2293 @@
+<#
+.SYNOPSIS
+    Builds a filtered, ranked, and optionally scheduled reading plan from Goodreads author-list URLs.
+
+.DESCRIPTION
+    Reads a comma- or tab-delimited file with URL and Genre columns, optionally skips
+    rows marked Y in an Exclude column, and force-includes rows marked Y in an Include
+    column. Force-included authors bypass ratings-based pagination and book/series
+    thresholds, but all non-rating eligibility and safety rules still apply. The script
+    crawls each remaining Goodreads author list, filters standalone books and series,
+    ranks authors using a configurable genre rotation, and exports one CSV reading plan.
+    By default, individual book pages are requested only for plausible survivors.
+    AuthorListOnly prevents all individual book-page requests.
+    Goodreads responses are not cached or retained between runs.
+    Duplicate displayed titles for the same author are reduced to the copy with the
+    highest Goodreads ratings count.
+    A book must contain a valid "published YYYY" value on the author-list page; rows
+    without a publication year are excluded before any standalone or series calculation.
+
+    Important interpretation: the output column named "Review count" contains the
+    Goodreads ratings count. This is also the count used by MinimumRatingsCount.
+
+    The script uses public HTML only. It does not sign in, bypass access controls, or
+    require a Goodreads API key. Goodreads can change its HTML at any time; parsing
+    failures are recorded in the log.
+
+.PARAMETER InputCsv
+    Input CSV/TSV containing the required URL and Genre columns. An optional Exclude
+    column skips a row before URL validation or any Goodreads request when its trimmed
+    value is Y (case-insensitive). An optional Include column force-includes all otherwise
+    eligible books for that author without applying rating, ratings-count, series-average,
+    or ratings-based pagination cutoffs. Include does not override missing publication
+    years, contributor-only records, adaptations, omnibus/collection exclusions,
+    duplicate handling, or required page counts. A row cannot have Y in both columns.
+    An optional Author column is used only to make log messages easier to identify. Other
+    columns are ignored. Plain URLs and Markdown-style [text](URL) values are accepted.
+
+.PARAMETER OutputCsv
+    Destination CSV. Defaults to Goodreads-Reading-Plan.csv in the current directory.
+
+.PARAMETER Order
+    Author interleaving order. Accepted values include "Order 1" through "Order 4",
+    "Order1" through "Order4", and 1 through 4.
+
+.PARAMETER StartDate
+    Candidate start date for the first book. Friday and Saturday values advance to
+    Sunday. Sunday through Thursday are used as supplied. Defaults to today. Ignored
+    when AuthorListOnly is used.
+
+.PARAMETER MinimumRating
+    Minimum standalone rating and minimum unweighted series average. Defaults to 4.0.
+
+.PARAMETER MinimumRatingsCount
+    Minimum Goodreads ratings count for a standalone or the #1 book of a series.
+    Defaults to 1000. The current author-list page is processed completely, but the
+    script does not request its next page when any listed book has fewer ratings than
+    this value.
+
+.PARAMETER PagesPerReadingDay
+    Pages assigned to each Sunday-through-Thursday reading day. Defaults to 20. Ignored
+    when AuthorListOnly is used.
+
+.PARAMETER ScheduleCutoffYear
+    The first year for which no dates are assigned. The qualifying book and every
+    subsequent book receive blank dates. Defaults to the execution year plus two.
+    Ignored when AuthorListOnly is used.
+
+.PARAMETER MaxConcurrency
+    Maximum concurrent Goodreads book-detail requests. Defaults to 3 and is capped at 4.
+    Ignored when AuthorListOnly is used.
+
+.PARAMETER RequestDelayMs
+    Minimum spacing between request starts. Defaults to 1000 milliseconds.
+
+.PARAMETER LogPath
+    Log-file path. Defaults to the output path with a .log extension.
+
+.PARAMETER AuthorListOnly
+    Never requests individual Goodreads book pages. Series information is taken only
+    from author-list titles, while Pages and both estimated reading-date columns are
+    left blank. This is the fastest mode.
+
+.PARAMETER FullMetadataScan
+    Opens every candidate book detail page before filtering. By default, the script
+    first rejects clearly ineligible standalones and series using the lighter author
+    list pages. Use this switch if an unusual Goodreads record omits or mislabels its
+    series on the author list page. It cannot be combined with AuthorListOnly.
+
+.EXAMPLE
+    ./Get-GoodreadsReadingPlan.ps1 `
+        -InputCsv ./authors.csv `
+        -OutputCsv ./reading-plan.csv `
+        -Order 'Order 1' `
+        -Verbose
+
+.EXAMPLE
+    ./Get-GoodreadsReadingPlan.ps1 `
+        -InputCsv ./authors.tsv `
+        -Order 4 `
+        -AuthorListOnly
+
+.NOTES
+    Target runtime: PowerShell 7.2 or later.
+#>
+
+[System.Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+    'PSReviewUnusedParameter',
+    '',
+    Justification = 'Script parameters are consumed by private helper functions through script scope.'
+)]
+[System.Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+    'PSUseShouldProcessForStateChangingFunctions',
+    '',
+    Justification = 'Private helpers construct HTTP objects or perform writes explicitly requested by the script invocation.'
+)]
 [CmdletBinding()]
 param(
-    # You can pass one or more author names and/or one or more Goodreads author URLs,
-    # OR provide a CSV with columns like:
-    #   - Author/Authors/Name + Genre (or Genres/Category/Categories)
-    #   - Url/URL/ListUrl/AuthorUrl + Genre (or Genres/Category/Categories)
-    [string[]]$Author,
-    [Alias('ListUrl')]
-    [string[]]$Url,
-    [string]$InCsv,
+    [Parameter(Mandatory, Position = 0)]
+    [ValidateScript({
+        if (-not (Test-Path -LiteralPath $_ -PathType Leaf)) {
+            throw "Input file does not exist: $_"
+        }
+        $true
+    })]
+    [Alias('ConfigCsv')]
+    [string]$InputCsv,
 
-    # First book's Estimated Start Date (for scheduling)
-    [datetime]$FirstStartDate,
+    [Parameter(Position = 1)]
+    [string]$OutputCsv = (Join-Path -Path (Get-Location) -ChildPath 'Goodreads-Reading-Plan.csv'),
 
-    # Optional CSV of exclusions with columns (Author, Title).
-    # Titles may be full ("Mistborn (Mistborn, #1)") or plain ("Mistborn").
-    [string]$ExcludeCsv,
+    [ValidateSet('1', '2', '3', '4', 'Order1', 'Order2', 'Order3', 'Order4',
+        'Order 1', 'Order 2', 'Order 3', 'Order 4', IgnoreCase = $true)]
+    [string]$Order = 'Order 1',
 
-    [switch]$ShowProgress,
-    [string]$OutCsv
+    [datetime]$StartDate = (Get-Date).Date,
+
+    [ValidateRange(0.0, 5.0)]
+    [double]$MinimumRating = 4.0,
+
+    [ValidateRange(0, [int]::MaxValue)]
+    [int]$MinimumRatingsCount = 1000,
+
+    [ValidateRange(1, 10000)]
+    [int]$PagesPerReadingDay = 20,
+
+    [ValidateRange(2000, 9999)]
+    [int]$ScheduleCutoffYear = ((Get-Date).Year + 2),
+
+    [ValidateRange(1, 4)]
+    [int]$MaxConcurrency = 3,
+
+    [ValidateRange(250, 30000)]
+    [int]$RequestDelayMs = 1000,
+
+    [ValidateRange(0, 20)]
+    [int]$MaxRetries = 5,
+
+    [ValidateRange(5, 300)]
+    [int]$RequestTimeoutSeconds = 45,
+
+    [string]$LogPath,
+
+    [ValidateLength(10, 512)]
+    [string]$UserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) GoodreadsReadingPlanner/1.0',
+
+    [Alias('SkipBookPages', 'NoBookPages')]
+    [switch]$AuthorListOnly,
+
+    [switch]$FullMetadataScan
 )
 
-# ── TLS for older PS ────────────────────────────────────────────────────
-try { [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 } catch {}
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
 
-# ── sanity check ────────────────────────────────────────────────────────
-if ((-not $Author -or $Author.Count -eq 0) -and (-not $Url -or $Url.Count -eq 0) -and (-not $InCsv)) {
-    throw "Provide one or more -Author values and/or -Url values, or specify -InCsv with a CSV file."
-}
+$script:InvariantCulture = [System.Globalization.CultureInfo]::InvariantCulture
+$script:Utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+$script:HttpClient = $null
+$script:HttpHandler = $null
+$script:LastRequestStartUtc = [datetime]::MinValue
+$script:CurrentDelayMs = $RequestDelayMs
+$script:SuccessesSinceThrottle = 0
+$script:ExclusionCounts = @{}
 
-# ── helpers (consolidated) ─────────────────────────────────────────────
-function Normalize-Url {
-    param([Parameter(Mandatory)][string]$Url)
-    $u = $Url.Trim() -replace ' ', '%20'
-    if ($u -notmatch '^[a-z][a-z0-9+\-.]*://') { $u = 'https://' + $u.TrimStart('/') }
-    $uri = $null
-    if (-not [System.Uri]::TryCreate($u, [System.UriKind]::Absolute, [ref]$uri)) {
-        throw "Bad URL after normalization: '$u'"
-    }
-    $uri.AbsoluteUri
-}
-
-function Strip-Tags { param([string]$Html) if (-not $Html) { return $Html } ; ([regex]::Replace($Html, '<[^>]+>', '')).Trim() }
-
-function Clean-Text {
-    param([string]$HtmlOrFragment)
-    if (-not $HtmlOrFragment) { return $null }
-    $t = [System.Net.WebUtility]::HtmlDecode(([regex]::Replace($HtmlOrFragment, '<[^>]+>', ' ')))
-    $t = $t.Replace([char]0xA0, ' ')
-    ($t -replace '\s+', ' ').Trim()
-}
-
-function Get-Html {
-    param([string]$Url,[int]$MaxRetry = 3)
-    $headers = @{
-        'Accept'            = 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8'
-        'Accept-Language'   = 'en-US,en;q=0.9'
-        'Cache-Control'     = 'no-cache'
-        'Pragma'            = 'no-cache'
-    }
-    for ($i = 1; $i -le $MaxRetry; $i++) {
-        try {
-            $norm = Normalize-Url $Url
-            Write-Verbose "GET $norm (try $i)"
-            return Invoke-WebRequest -Uri $norm -UseBasicParsing `
-                   -UserAgent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0 Safari/537.36" `
-                   -Headers $headers -MaximumRedirection 5 -ErrorAction Stop
-        } catch {
-            if ($i -eq $MaxRetry) {
-                throw "Invoke-WebRequest failed for URL '$Url' (normalized: '$norm'): $($_.Exception.Message)"
-            }
-            Start-Sleep -Seconds ([math]::Pow(2,$i))
-        }
-    }
-}
-
-function Parse-Int { param([string]$s) ($s -replace '[^\d]','') -as [int] }
-
-function Get-JsonLdStrings {
-    param([Parameter(Mandatory)][string]$Html)
-    ([regex]::Matches($Html,'<script[^>]+type="application/ld\+json"[^>]*>(?<j>[\s\S]+?)</script>','IgnoreCase')).Groups |
-        ForEach-Object { $_ } | Where-Object { $_.Name -eq 'j' } | ForEach-Object { $_.Value }
-}
-
-function Resolve-GoodreadsAuthorListBaseUrl {
-    param([string]$Author,[string]$Url)
-    $id = $null
-    if ($Url) {
-        if ($Url -match 'goodreads\.com/author/(?:show|list)/(?<id>\d+)') { $id = $Matches['id'] }
-        else { throw "URL must be a Goodreads author 'show' or 'list' page." }
-    } elseif ($Author) {
-        $q = [System.Net.WebUtility]::UrlEncode($Author)
-        $searchUrl = "https://www.goodreads.com/search?q=$q&search_type=authors"
-        $searchHtml = (Get-Html $searchUrl).Content
-        $m = [regex]::Match($searchHtml, '/author/(?:list|show)/(?<id>\d+)', 'IgnoreCase')
-        if (!$m.Success) { throw "Could not find an author ID for '$Author'." }
-        $id = $m.Groups['id'].Value
-    } else { throw "Provide either -Author or -Url to resolve the author list base URL." }
-    $baseNoQuery = "https://www.goodreads.com/author/list/$id"
-    ('{0}?page={{0}}' -f $baseNoQuery)
-}
-
-function Get-AuthorIdFromListTemplate { param([string]$Template) $m = [regex]::Match($Template,'/author/list/(?<id>\d+)','IgnoreCase'); if ($m.Success) { $m.Groups['id'].Value } }
-
-function Get-AuthorDisplayNameById {
-    param([Parameter(Mandatory)][string]$AuthorId)
-    $showUrl = "https://www.goodreads.com/author/show/$AuthorId"
-    try { $html = (Get-Html $showUrl).Content } catch { return "Author $AuthorId" }
-    foreach ($j in (Get-JsonLdStrings -Html $html)) {
-        if ($j -match '"@type"\s*:\s*"Person"') {
-            $m = [regex]::Match($j, '"name"\s*:\s*"(?<nm>[^"]+)"', 'IgnoreCase')
-            if ($m.Success) { return [System.Net.WebUtility]::HtmlDecode($m.Groups['nm'].Value).Trim() }
-        }
-    }
-    $m = [regex]::Match($html,'<h1[^>]*class="authorName"[^>]*>[\s\S]*?<span[^>]*itemprop="name"[^>]*>(?<nm>[^<]+)</span>','IgnoreCase')
-    if ($m.Success) { return [System.Net.WebUtility]::HtmlDecode($m.Groups['nm'].Value).Trim() }
-    $m = [regex]::Match($html,'data-testid="authorName"[^>]*>\s*([^<]+)\s*<','IgnoreCase')
-    if ($m.Success) { return [System.Net.WebUtility]::HtmlDecode($m.Groups[1].Value).Trim() }
-    "Author $AuthorId"
-}
-
-function Get-CanonicalBookHtml {
-    param([Parameter(Mandatory)][string]$BookUrl)
-    $html = (Get-Html $BookUrl).Content
-    if ($BookUrl -match '/work/') {
-        $canon = [regex]::Match($html, '<link[^>]+rel="canonical"[^>]+href="(?<h>[^"]+)"','IgnoreCase')
-        if ($canon.Success -and $canon.Groups['h'].Value -match '/book/show/') { return (Get-Html $canon.Groups['h'].Value).Content }
-        $m = [regex]::Match($html, 'href="(?<h>/book/show/[^"#]+)"','IgnoreCase')
-        if ($m.Success) { return (Get-Html ("https://www.goodreads.com" + $m.Groups['h'].Value)).Content }
-    }
-    return $html
-}
-
-function Normalize-Genre {
-    param([string]$g)
-    if (-not $g) { return 'Other' }
-    $t = $g.Trim().ToLowerInvariant()
-    if ($t -match 'fantasy') { return 'Fantasy' }
-    if ($t -match 'sci[\s\-]*fi|science[\s\-]*fiction|sf') { return 'Science-Fiction' }
-    'Other'
-}
-
-# ── Title/Author normalization helpers for exclusions ───────────────────
-function Normalize-Key([string]$s){
-    if (-not $s) { return '' }
-    ($s -replace '\s+',' ' ).Trim().ToLowerInvariant()
-}
-function Simplify-Title([string]$t){
-    if (-not $t) { return '' }
-    $x = [System.Net.WebUtility]::HtmlDecode($t)
-    ($x -replace '\s*\(.*$','').Trim()
-}
-
-# Extract number of pages (robust)
-function Get-PageCountFromHtml {
-    param([Parameter(Mandatory)][string]$Html)
-    if (-not $Html -or $Html.Length -lt 1000) { return $null }
-    foreach ($j in (Get-JsonLdStrings -Html $Html)) {
-        if ($j -match '"@type"\s*:\s*"Book"') {
-            $n = [regex]::Match($j, '"numberOfPages"\s*:\s*"?(?<p>\d{1,5})"?', 'IgnoreCase'); if ($n.Success) { return [int]$n.Groups['p'].Value }
-        }
-        $pc = [regex]::Match($j, '"pageCount"\s*:\s*(?<p>\d{1,5})', 'IgnoreCase'); if ($pc.Success) { return [int]$pc.Groups['p'].Value }
-    }
-    $m = [regex]::Match($Html, '<meta[^>]+itemprop="numberOfPages"[^>]+content="(?<p>\d{1,5})"', 'IgnoreCase'); if ($m.Success) { return [int]$m.Groups['p'].Value }
-    $m = [regex]::Match($Html, '<span[^>]*itemprop="numberOfPages"[^>]*>\s*(?<p>\d{1,5})\s*pages?\s*</span>', 'IgnoreCase'); if ($m.Success) { return [int]$m.Groups['p'].Value }
-    $m = [regex]::Match($Html, '<p[^>]*data-testid\s*=\s*"(?:pagesFormat|pages)"[^>]*>\s*(?<inner>[\s\S]*?)</p>', 'IgnoreCase')
-    if ($m.Success) { $txt = Clean-Text $m.Groups['inner'].Value; $mp = [regex]::Match($txt, '(?i)\b(?<p>\d{1,5}(?:,\d{3})?)\s*pages?\b'); if ($mp.Success) { return [int](($mp.Groups['p'].Value) -replace ',', '') } }
-    $anyScript = [regex]::Matches($Html, '<script[^>]*>(?<s>[\s\S]*?)</script>', 'IgnoreCase')
-    foreach ($s in $anyScript) {
-        $blob = $s.Groups['s'].Value
-        $pc = [regex]::Match($blob, '"pageCount"\s*:\s*(?<p>\d{1,5})', 'IgnoreCase'); if ($pc.Success) { return [int]$pc.Groups['p'].Value }
-        $np = [regex]::Match($blob, '"numberOfPages"\s*:\s*"?(?<p>\d{1,5})"?', 'IgnoreCase'); if ($np.Success) { return [int]$np.Groups['p'].Value }
-        $np2= [regex]::Match($blob, '"numPages"\s*:\s*(?<p>\d{1,5})', 'IgnoreCase'); if ($np2.Success){ return [int]$np2.Groups['p'].Value }
-    }
-    $region = $Html; $anchor = [regex]::Match($Html, '(?i)data-testid="bookDetails"|data-testid="pagesFormat"|class="FeaturedDetails"|>\s*Book\s*Details\s*<')
-    if ($anchor.Success) { $start = [Math]::Max(0, $anchor.Index - 5000); $len = [Math]::Min(90000, $Html.Length - $start); $region = $Html.Substring($start, $len) } else { $region = $Html.Substring(0, [Math]::Min(150000, $Html.Length)) }
-    $clean = Clean-Text $region; $m = [regex]::Match($clean, '(?i)\b(?<p>\d{1,5}(?:,\d{3})?)\s*pages?\b')
-    if ($m.Success) { return [int](($m.Groups['p'].Value) -replace ',', '') }
-    return $null
-}
-
-# Extract robust rating + ratings count from a book page (many fallbacks)
-function Get-BookRatingsFromHtml {
-    param([Parameter(Mandatory)][string]$Html)
-    $avg = $null; $count = $null
-
-    foreach ($j in (Get-JsonLdStrings -Html $Html)) {
-        if ($j -match '"@type"\s*:\s*"Book"') {
-            $ar = [regex]::Match($j, '"aggregateRating"\s*:\s*\{(?<obj>[\s\S]+?)\}', 'IgnoreCase')
-            if ($ar.Success) {
-                $obj = $ar.Groups['obj'].Value
-                $mv = [regex]::Match($obj, '"(?:ratingValue|averageRating)"\s*:\s*"?(?<v>\d(?:\.\d{1,3})?)"?', 'IgnoreCase')
-                if ($mv.Success) { $avg = [double]$mv.Groups['v'].Value }
-                $mc = [regex]::Match($obj, '"(?:ratingCount|reviewCount)"\s*:\s*"?(?<c>[\d,]+)"?', 'IgnoreCase')
-                if ($mc.Success) { $count = Parse-Int $mc.Groups['c'].Value }
-                if ($avg -or $count) { return @{ AvgRating=$avg; ReviewCount=$count } }
-            }
-        }
-        if ($j -match '"@type"\s*:\s*"AggregateRating"') {
-            $mv = [regex]::Match($j, '"(?:ratingValue|averageRating)"\s*:\s*"?(?<v>\d(?:\.\d{1,3})?)"?', 'IgnoreCase')
-            if ($mv.Success) { $avg = [double]$mv.Groups['v'].Value }
-            $mc = [regex]::Match($j, '"(?:ratingCount|reviewCount)"\s*:\s*"?(?<c>[\d,]+)"?', 'IgnoreCase')
-            if ($mc.Success) { $count = Parse-Int $mc.Groups['c'].Value }
-            if ($avg -or $count) { return @{ AvgRating=$avg; ReviewCount=$count } }
-        }
-    }
-
-    $mV = [regex]::Match($Html, '<meta[^>]+itemprop="ratingValue"[^>]+content="(?<v>[\d.]+)"', 'IgnoreCase')
-    if ($mV.Success) { $avg = [double]$mV.Groups['v'].Value }
-    $mC = [regex]::Match($Html, '<meta[^>]+itemprop="ratingCount"[^>]+content="(?<c>[\d,]+)"', 'IgnoreCase')
-    if ($mC.Success) { $count = Parse-Int $mC.Groups['c'].Value }
-    if ($avg -or $count) { return @{ AvgRating=$avg; ReviewCount=$count } }
-
-    $sV = [regex]::Match($Html, '<span[^>]+itemprop="ratingValue"[^>]*>\s*(?<v>[\d.]+)\s*</span>', 'IgnoreCase')
-    if ($sV.Success) { $avg = [double]$sV.Groups['v'].Value }
-    $sC = [regex]::Match($Html, '<span[^>]+itemprop="ratingCount"[^>]*>\s*(?<c>[\d,]+)\s*</span>', 'IgnoreCase')
-    if ($sC.Success) { $count = Parse-Int $sC.Groups['c'].Value }
-    if ($avg -or $count) { return @{ AvgRating=$avg; ReviewCount=$count } }
-
-    $dtC = [regex]::Match($Html, '<[^>]+data-testid="(?:ratingsCount|ratingCount)"[^>]*>(?<t>[^<]+)</', 'IgnoreCase')
-    if ($dtC.Success) { $count = Parse-Int $dtC.Groups['t'].Value }
-    $dtV = [regex]::Match($Html, '<[^>]+data-testid="(?:rating|ratingValue)"[^>]*>\s*(?<v>\d(?:\.\d{1,3})?)\s*<', 'IgnoreCase')
-    if ($dtV.Success) { $avg = [double]$dtV.Groups['v'].Value }
-    if ($avg -or $count) { return @{ AvgRating=$avg; ReviewCount=$count } }
-
-    $scripts = [regex]::Matches($Html, '<script[^>]*>(?<s>[\s\S]*?)</script>', 'IgnoreCase')
-    foreach ($s in $scripts) {
-        $blob = $s.Groups['s'].Value
-        if ($blob -match '"aggregateRating"' -or $blob -match '"ratingsCount"') {
-            $mv = [regex]::Match($blob, '"(?:ratingValue|averageRating)"\s*:\s*"?(?<v>\d(?:\.\d{1,3})?)"?', 'IgnoreCase')
-            if ($mv.Success) { $avg = [double]$mv.Groups['v'].Value }
-            $mc = [regex]::Match($blob, '"(?:ratingCount|ratingsCount|reviewCount)"\s*:\s*"?(?<c>[\d,]+)"?', 'IgnoreCase')
-            if ($mc.Success) { $count = Parse-Int $mc.Groups['c'].Value }
-            if ($avg -or $count) { return @{ AvgRating=$avg; ReviewCount=$count } }
-        }
-    }
-
-    $t = Clean-Text $Html
-    $m = [regex]::Match($t, '(?<v>\d\.\d{1,3})\s*avg\s*rating', 'IgnoreCase')
-    if ($m.Success) { $avg = [double]$m.Groups['v'].Value }
-    $m2 = [regex]::Match($t, '\((?<c>[\d,]+)\s+ratings\)', 'IgnoreCase')
-    if ($m2.Success) { $count = Parse-Int $m2.Groups['c'].Value }
-    if ($avg -or $count) { return @{ AvgRating=$avg; ReviewCount=$count } }
-
-    return @{ AvgRating=$null; ReviewCount=$null }
-}
-
-# Detect age category tags: Young Adult / Middle Grade / Children
-function Get-AgeCategory {
-    param(
-        [string[]]$Genres,
-        [string]$GenresHtml,
-        [string]$FullHtml
-    )
-    if (-not $Genres) { $Genres = @() }
-    if (-not $GenresHtml) { $GenresHtml = '' }
-    if (-not $FullHtml) { $FullHtml = '' }
-
-    $cats = New-Object System.Collections.Generic.HashSet[string] ([System.StringComparer]::OrdinalIgnoreCase)
-
-    foreach ($g in $Genres) {
-        $gl = $g.ToLowerInvariant()
-        if ($gl -match '\byoung[\s-]*adult\b' -or $gl -match '\bya\b') { [void]$cats.Add('Young Adult') }
-        if ($gl -match '\bmiddle[\s-]*grade\b' -or $gl -match '\bmg\b') { [void]$cats.Add('Middle Grade') }
-        if ($gl -match '\bchildren(?:\x27|\u2019)?s\b' -or $gl -match '\bchildrens\b' -or $gl -match '\bkids\b') { [void]$cats.Add('Children') }
-    }
-
-    foreach ($hay in @($GenresHtml,$FullHtml)) {
-        if ($hay -match '(?i)/(genres|shelf/show)/(young-adult|ya)\b') { [void]$cats.Add('Young Adult') }
-        if ($hay -match '(?i)/(genres|shelf/show)/middle-grade\b')     { [void]$cats.Add('Middle Grade') }
-        if ($hay -match '(?i)/(genres|shelf/show)/(children|childrens|kids)\b') { [void]$cats.Add('Children') }
-    }
-
-    if ($cats.Count -eq 0) { return $null }
-    $order = @('Children','Middle Grade','Young Adult')
-    ($order | Where-Object { $cats.Contains($_) }) -join '; '
-}
-
-# Parse a single Goodreads book page to get core info + age category
-function Get-BookPageDetails {
+function Get-UnresolvedFullPath {
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$BookUrl)
-    $html = Get-CanonicalBookHtml -BookUrl $BookUrl
-
-    # Title
-    $title = $null
-    foreach ($j in (Get-JsonLdStrings -Html $html)) {
-        if ($j -match '"@type"\s*:\s*"Book"') {
-            $mt = [regex]::Match($j, '"name"\s*:\s*"(?<nm>[^"]+)"', 'IgnoreCase')
-            if ($mt.Success) { $title = [System.Net.WebUtility]::HtmlDecode($mt.Groups['nm'].Value); break }
-        }
-    }
-    if (-not $title) {
-        $mh1 = [regex]::Match($html, '<h1[^>]*data-testid="bookTitle"[^>]*>(?<t>[\s\S]*?)</h1>', 'IgnoreCase')
-        if ($mh1.Success) { $title = [System.Net.WebUtility]::HtmlDecode((Strip-Tags $mh1.Groups['t'].Value)) }
-    }
-    if (-not $title) {
-        $mog = [regex]::Match($html, '<meta[^>]+property="og:title"[^>]+content="(?<t>[^"]+)"', 'IgnoreCase')
-        if ($mog.Success) {
-            $cand = [System.Net.WebUtility]::HtmlDecode($mog.Groups['t'].Value).Trim()
-            if ($cand -notmatch '^(?i)goodreads\b') { $title = $cand }
-        }
-    }
-
-    # Pub year
-    $pubYear = $null
-    foreach ($j in (Get-JsonLdStrings -Html $html)) {
-        $my = [regex]::Match($j, '"datePublished"\s*:\s*"(?<d>[^"]+)"', 'IgnoreCase')
-        if ($my.Success) { $y = [regex]::Match($my.Groups['d'].Value, '\b(\d{4})\b'); if ($y.Success) { $pubYear = [int]$y.Groups[1].Value; break } }
-    }
-    if (-not $pubYear) {
-        $m = [regex]::Match($html, '<meta[^>]+itemprop="datePublished"[^>]+content="(?<d>[^"]+)"', 'IgnoreCase')
-        if ($m.Success) { $y = [regex]::Match($m.Groups['d'].Value, '\b(\d{4})\b'); if ($y.Success) { $pubYear = [int]$y.Groups[1].Value } }
-    }
-    if (-not $pubYear) {
-        $m = [regex]::Match($html, '(?:First\s+)?Published[^0-9]{0,30}(\d{4})', 'IgnoreCase'); if ($m.Success) { $pubYear = [int]$m.Groups[1].Value }
-    }
-
-    # Genres
-    $genres = New-Object System.Collections.Generic.List[string]
-    $genrePatterns = @(
-    '<a[^>]*class="[^"]*bookPageGenreLink[^"]*"[^>]*>(?<g>[^<]+)</a>',
-    '<a[^>]*data-testid="bookPageGenreLink"[^>]*>(?<g>[^<]+)</a>',
-    '<a[^>]*data-testid="genreChip"[^>]*>(?<g>[^<]+)</a>',
-    '<a[^>]*href="/genres/[^"]+"[^>]*>(?<g>[^<]+)</a>',
-    '<a[^>]*class="[^"]*Button--tag-inline[^"]*"[^>]*>(?<g>[^<]+)</a>'
-    )
-    foreach ($pat in $genrePatterns) {
-        $ms = [regex]::Matches($html, $pat, 'Singleline,IgnoreCase')
-        foreach ($m in $ms) { $g = ([System.Net.WebUtility]::HtmlDecode($m.Groups['g'].Value)).Trim(); if ($g -and -not $genres.Contains($g)) { [void]$genres.Add($g) } }
-    }
-
-    $snippet = ''
-    $blk = [regex]::Match($html, '(<section[^>]*genres[^>]*>[\s\S]{0,8000}?</section>)|(<div[^>]*genres[^>]*>[\s\S]{0,8000}?</div>)', 'IgnoreCase')
-    if ($blk.Success) { $snippet = $blk.Value } else {
-        $anchors = [regex]::Matches($html, '<a[^>]+href="/genres/[^"]+"[^>]*>[^<]+</a>', 'IgnoreCase')
-        if ($anchors.Count -gt 0) { $sb = New-Object System.Text.StringBuilder; foreach ($a in $anchors) { [void]$sb.Append($a.Value) }; $snippet = $sb.ToString() }
-    }
-
-    $pages    = Get-PageCountFromHtml -Html $html
-    $ratings  = Get-BookRatingsFromHtml -Html $html
-    $hayLen   = [Math]::Min($html.Length, 150000)
-    $haystack = ($snippet + ' ' + $html.Substring(0, $hayLen))
-    $ageCat   = Get-AgeCategory -Genres $genres -GenresHtml $snippet -FullHtml $haystack
-
-    [pscustomobject]@{
-        Title          = $title
-        PubYear        = $pubYear
-        Genres         = $genres
-        GenresHtml     = $snippet
-        GenresHaystack = $haystack
-        Pages          = $pages
-        AvgRating      = $ratings.AvgRating
-        ReviewCount    = $ratings.ReviewCount
-        AgeCategory    = $ageCat
-    }
-}
-
-function Get-BooksForAuthor {
     param(
-        [Parameter(Mandatory)][string]$BaseTemplate,
-        [Parameter(Mandatory)][string]$AuthorName,
-        [string]$AuthorGenreGroup   = 'Other',  # For interleaving pattern (Fantasy / Science-Fiction / Other)
-        [string]$AuthorGenreDisplay = 'Other',  # What to display in output (raw CSV genre if not F/SF)
-        [hashtable]$ExclusionMap,               # authorKey -> HashSet(normalized titles)
-        [switch]$ShowProgress
+        [Parameter(Mandatory)]
+        [string]$Path
     )
 
-    # ── scrape list pages (collect everything; early-stop by page if min ratings < 1000) ─
-    $page=1; $rawRows=New-Object System.Collections.Generic.List[object]
-    $firstHtml=(Get-Html ($BaseTemplate -f $page)).Content
-    $totalPages= if ($firstHtml -match 'page\s+\d+\s+of\s+(\d+)'){[int]$matches[1]}else{$null}
+    return $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+}
 
-    if ($ShowProgress){ Write-Progress -Id 11 -Activity "Scraping list pages ($AuthorName)" -Status "Start" -PercentComplete 0 }
-    function Update-BarLocal { param($cur,$tot,$name,$show) if($show){ $pct=if($tot){[int](($cur-1)/$tot*100)}else{0}; Write-Progress -Id 11 -Activity "Scraping list pages ($name)" -Status "Page $cur$('/'+$tot)" -PercentComplete $pct } }
+function Write-RunLog {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('DEBUG', 'INFO', 'WARN', 'ERROR')]
+        [string]$Level,
 
-    $stopPaging = $false
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string]$Message
+    )
 
-    do {
-        Update-BarLocal $page $totalPages $AuthorName $ShowProgress
-        $html = if ($page -eq 1){$firstHtml}else{ (Get-Html ($BaseTemplate -f $page)).Content }
+    $safeMessage = $Message -replace '[\r\n]+', ' '
+    $line = '{0} [{1}] {2}{3}' -f (
+        [datetime]::Now.ToString('yyyy-MM-dd HH:mm:ss.fff zzz', $script:InvariantCulture),
+        $Level,
+        $safeMessage,
+        [Environment]::NewLine
+    )
 
-        $minCountOnPage = [int]::MaxValue
-        $parsedAnyCount = $false
+    [System.IO.File]::AppendAllText($script:LogPath, $line, $script:Utf8NoBom)
 
-        foreach ($row in ($html -split '(?=<tr)')) {
-            if ($row -notmatch 'class="bookTitle"') { continue }
+    switch ($Level) {
+        'DEBUG' { Write-Verbose $safeMessage }
+        'INFO'  { Write-Verbose $safeMessage }
+        'WARN'  { Write-Warning $safeMessage }
+        'ERROR' { Write-Warning $safeMessage }
+    }
+}
 
-            # Title + URL
-            $titleFromRow=''; $bookUrl=$null
-            $mTitle = [regex]::Match($row,'<a[^>]*class="bookTitle"[^>]*href="(?<href>[^"]+)"[^>]*>(?<inner>[\s\S]*?)</a>','IgnoreCase,Singleline')
-            if ($mTitle.Success) {
-                $href = $mTitle.Groups['href'].Value
-                $bookUrl = if ($href -like 'http*') { $href } else { "https://www.goodreads.com$href" }
-                $inner = $mTitle.Groups['inner'].Value
-                $mName = [regex]::Match($inner,'<span[^>]*itemprop="name"[^>]*>(?<t>[^<]+)</span>','IgnoreCase')
-                if ($mName.Success) { $titleFromRow = [System.Net.WebUtility]::HtmlDecode($mName.Groups['t'].Value).Trim() }
-                else { $titleFromRow = [System.Net.WebUtility]::HtmlDecode((Strip-Tags $inner)) }
-            } else { continue }
+function Add-Exclusion {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Reason,
 
-            # Row-level hints
-            $pubYear=$null; $mYear=[regex]::Match($row,'published\s+(?:\w+\s+)?(\d{4})','IgnoreCase'); if ($mYear.Success){ $pubYear=[int]$mYear.Groups[1].Value }
-            $seriesName,$seriesNum=$null,$null
-            $m=[regex]::Match($row,'\(([^#(]+)#\s*([\d]+(?:\.\d+)?)')
-            if ($m.Success) {
-                $seriesName = ($m.Groups[1].Value -replace '\s+$','').Trim()
-                $numString  = $m.Groups[2].Value
-                $tmp=0.0; [double]::TryParse($numString,[System.Globalization.NumberStyles]::Float,[System.Globalization.CultureInfo]::InvariantCulture,[ref]$tmp) | Out-Null
-                if (-not [double]::IsNaN($tmp)) { $seriesNum = $tmp }
-            }
+        [string]$Author,
 
-            # page-level early stop metric
-            $mCount=[regex]::Match($row,'([\d,]+)\s*(?:ratings|reviews)','IgnoreCase')
-            if ($mCount.Success) {
-                $parsedAnyCount = $true
-                $c = Parse-Int $mCount.Groups[1].Value
-                if ($c -lt $minCountOnPage) { $minCountOnPage = $c }
-            }
+        [string]$Title
+    )
 
-            $rawRows.Add([pscustomobject]@{
-                TitleRow    = $titleFromRow
-                Url         = $bookUrl
-                PubYear     = $pubYear
-                SeriesName  = $seriesName
-                SeriesNum   = $seriesNum
-            })
-        }
+    if (-not $script:ExclusionCounts.ContainsKey($Reason)) {
+        $script:ExclusionCounts[$Reason] = 0
+    }
+    $script:ExclusionCounts[$Reason]++
 
-        $hasNext = ($html -match 'rel="next"')
-        if ($parsedAnyCount -and $minCountOnPage -lt 1000) { $stopPaging = $true }
-        if ($stopPaging) { $hasNext = $false }
+    $context = @($Author, $Title) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    if ($context.Count -gt 0) {
+        Write-RunLog -Level DEBUG -Message ("Excluded [{0}]: {1}" -f $Reason, ($context -join ' - '))
+    }
+}
 
-        $page++
-        Start-Sleep -Milliseconds (Get-Random -Min 800 -Max 1600)
-    } while ($hasNext)
+function ConvertFrom-HtmlText {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [string]$Value
+    )
 
-    if ($ShowProgress){ Write-Progress -Id 11 -Activity "Scraping list pages ($AuthorName)" -Completed }
-
-    if (-not $rawRows -or $rawRows.Count -eq 0) {
-        Write-Warning "No titles found on the author list for '$AuthorName'."
-        return @()
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return ''
     }
 
-    $authorKey = Normalize-Key $AuthorName
-    $titleBanSet = $null
-    if ($ExclusionMap -and $ExclusionMap.ContainsKey($authorKey)) { $titleBanSet = $ExclusionMap[$authorKey] }
+    $withoutTags = [regex]::Replace($Value, '(?is)<!--.*?-->|<[^>]+>', ' ')
+    $decoded = [System.Net.WebUtility]::HtmlDecode($withoutTags)
+    return ([regex]::Replace($decoded, '\s+', ' ')).Trim()
+}
 
-    # ── fetch book pages; keep ALL (post-exclusion) for later series/standalone gating ─
-    $collected = New-Object System.Collections.Generic.List[object]
-    $idx=0
-    foreach ($b in $rawRows) {
-        $idx++; if ($ShowProgress) { $pct=[int](($idx/$rawRows.Count)*100); Write-Progress -Id 12 -Activity "Fetching book pages ($AuthorName)" -Status $b.TitleRow -PercentComplete $pct }
+function Get-ObjectPropertyValue {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [object]$InputObject,
+
+        [Parameter(Mandatory)]
+        [string]$Name
+    )
+
+    if ($null -eq $InputObject) {
+        return $null
+    }
+
+    $property = $InputObject.PSObject.Properties[$Name]
+    if ($null -eq $property) {
+        return $null
+    }
+
+    return $property.Value
+}
+
+function ConvertTo-InvariantNumber {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Value,
+
+        [Parameter(Mandatory)]
+        [ValidateSet('Double', 'Int64')]
+        [string]$Type
+    )
+
+    $clean = $Value.Replace(',', '').Trim()
+    if ($Type -eq 'Double') {
+        $parsedDouble = 0.0
+        if ([double]::TryParse(
+                $clean,
+                [System.Globalization.NumberStyles]::Float,
+                $script:InvariantCulture,
+                [ref]$parsedDouble)) {
+            return $parsedDouble
+        }
+    }
+    else {
+        $parsedInt = [long]0
+        if ([long]::TryParse(
+                $clean,
+                [System.Globalization.NumberStyles]::Integer,
+                $script:InvariantCulture,
+                [ref]$parsedInt)) {
+            return $parsedInt
+        }
+    }
+
+    throw "Could not parse numeric value '$Value'."
+}
+
+function Format-Decimal {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [object]$Value,
+
+        [ValidateRange(0, 10)]
+        [int]$MaximumDecimals = 3
+    )
+
+    if ($null -eq $Value) {
+        return ''
+    }
+
+    $format = if ($MaximumDecimals -eq 0) {
+        '0'
+    }
+    else {
+        '0.' + ('#' * $MaximumDecimals)
+    }
+
+    return ([double]$Value).ToString($format, $script:InvariantCulture)
+}
+
+function Protect-CsvText {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [string]$Value
+    )
+
+    if ([string]::IsNullOrEmpty($Value)) {
+        return ''
+    }
+
+    # Prevent spreadsheet programs from evaluating scraped text as a formula.
+    if ($Value -match '^[=+\-@]') {
+        return "'$Value"
+    }
+
+    return $Value
+}
+
+function ConvertTo-NormalizedAuthorUrl {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Value
+    )
+
+    $candidate = $Value.Trim()
+    $markdownMatch = [regex]::Match($candidate, '^\[[^\]]*\]\((?<url>https?://[^)]+)\)$', 'IgnoreCase')
+    if ($markdownMatch.Success) {
+        $candidate = $markdownMatch.Groups['url'].Value
+    }
+
+    $candidate = $candidate.Replace('\_', '_')
+    $uri = $null
+    if (-not [uri]::TryCreate($candidate, [System.UriKind]::Absolute, [ref]$uri)) {
+        throw "Invalid Goodreads URL: '$Value'."
+    }
+
+    if ($uri.Scheme -ne 'https' -or $uri.Host -notin @('goodreads.com', 'www.goodreads.com')) {
+        throw "Only HTTPS Goodreads URLs are allowed: '$Value'."
+    }
+
+    $pathMatch = [regex]::Match(
+        $uri.AbsolutePath,
+        '^/author/list/(?<id>\d+)(?:\.[A-Za-z0-9._~%\-]+)?/?$',
+        'IgnoreCase'
+    )
+    if (-not $pathMatch.Success) {
+        throw "Expected a Goodreads /author/list/<id> URL, received '$Value'."
+    }
+
+    $authorId = $pathMatch.Groups['id'].Value
+    $slug = $uri.AbsolutePath.TrimEnd('/').Split('/')[-1]
+    return [pscustomobject]@{
+        AuthorId = $authorId
+        Url      = "https://www.goodreads.com/author/list/$slug"
+    }
+}
+
+function Test-AllowedGoodreadsUri {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [uri]$Uri
+    )
+
+    if (-not $Uri.IsAbsoluteUri -or $Uri.Scheme -ne 'https') {
+        return $false
+    }
+
+    if ($Uri.Host -notin @('goodreads.com', 'www.goodreads.com')) {
+        return $false
+    }
+
+    return $Uri.AbsolutePath -match '^/(?:author/list|book/show)/'
+}
+
+function Resolve-GoodreadsRedirect {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [uri]$CurrentUri,
+
+        [Parameter(Mandatory)]
+        [uri]$Location
+    )
+
+    $resolved = if ($Location.IsAbsoluteUri) {
+        $Location
+    }
+    else {
+        [uri]::new($CurrentUri, $Location)
+    }
+
+    if (-not (Test-AllowedGoodreadsUri -Uri $resolved)) {
+        throw "Goodreads redirected to a disallowed URI: '$resolved'."
+    }
+
+    return $resolved
+}
+
+function Wait-ForRequestSlot {
+    [CmdletBinding()]
+    param()
+
+    if ($script:LastRequestStartUtc -ne [datetime]::MinValue) {
+        $elapsedMs = ([datetime]::UtcNow - $script:LastRequestStartUtc).TotalMilliseconds
+        $remainingMs = $script:CurrentDelayMs - $elapsedMs
+        if ($remainingMs -gt 0) {
+            Start-Sleep -Milliseconds ([int][math]::Ceiling($remainingMs))
+        }
+    }
+
+    $script:LastRequestStartUtc = [datetime]::UtcNow
+}
+
+function Test-GoodreadsChallengeResponse {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [System.Net.Http.HttpResponseMessage]$Response
+    )
+
+    if ($null -eq $Response) {
+        return $false
+    }
+
+    $values = $null
+    $hasChallengeHeader = $Response.Headers.TryGetValues('x-amzn-waf-action', [ref]$values) -and
+        (@($values) -contains 'challenge')
+    return $hasChallengeHeader -or ([int]$Response.StatusCode -eq 202 -and $Response.Content.Headers.ContentLength -eq 0)
+}
+
+function Register-GoodreadsThrottle {
+    [CmdletBinding()]
+    param()
+
+    $script:CurrentDelayMs = [math]::Min(10000, [math]::Max(3000, $script:CurrentDelayMs * 2))
+    $script:SuccessesSinceThrottle = 0
+    Write-RunLog -Level WARN -Message "Goodreads requested slower traffic; adaptive request spacing is now $($script:CurrentDelayMs) ms."
+}
+
+function Register-GoodreadsSuccess {
+    [CmdletBinding()]
+    param()
+
+    $script:SuccessesSinceThrottle++
+    if ($script:SuccessesSinceThrottle -ge 10 -and $script:CurrentDelayMs -gt $RequestDelayMs) {
+        $script:CurrentDelayMs = [math]::Max($RequestDelayMs, $script:CurrentDelayMs - 500)
+        $script:SuccessesSinceThrottle = 0
+        Write-RunLog -Level DEBUG -Message "Adaptive request spacing reduced to $($script:CurrentDelayMs) ms."
+    }
+}
+
+function Get-RetryDelay {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [int]$Attempt,
+
+        [AllowNull()]
+        [System.Net.Http.HttpResponseMessage]$Response
+    )
+
+    if (Test-GoodreadsChallengeResponse -Response $Response) {
+        $challengeDelay = 10000 * [math]::Pow(2, [math]::Min([math]::Max($Attempt - 1, 0), 3))
+        return [int][math]::Min(60000, $challengeDelay + [System.Random]::Shared.Next(500, 2001))
+    }
+
+    if ($null -ne $Response -and $null -ne $Response.Headers.RetryAfter) {
+        if ($null -ne $Response.Headers.RetryAfter.Delta) {
+            return [int][math]::Min(30000, [math]::Max(250, $Response.Headers.RetryAfter.Delta.TotalMilliseconds))
+        }
+
+        if ($null -ne $Response.Headers.RetryAfter.Date) {
+            $retryMs = ($Response.Headers.RetryAfter.Date.UtcDateTime - [datetime]::UtcNow).TotalMilliseconds
+            return [int][math]::Min(30000, [math]::Max(250, $retryMs))
+        }
+    }
+
+    $base = [math]::Min(30000, 500 * [math]::Pow(2, [math]::Min($Attempt, 6)))
+    return [int][math]::Min(30000, $base + [System.Random]::Shared.Next(100, 501))
+}
+
+function New-GoodreadsHttpClient {
+    [CmdletBinding()]
+    param()
+
+    $handler = [System.Net.Http.HttpClientHandler]::new()
+    $handler.AllowAutoRedirect = $false
+    $handler.UseCookies = $true
+    $handler.CookieContainer = [System.Net.CookieContainer]::new()
+    $handler.MaxConnectionsPerServer = $MaxConcurrency
+
+    $decompression = [System.Net.DecompressionMethods]::GZip -bor [System.Net.DecompressionMethods]::Deflate
+    if ([enum]::GetNames([System.Net.DecompressionMethods]) -contains 'Brotli') {
+        $decompression = $decompression -bor [System.Net.DecompressionMethods]::Brotli
+    }
+    $handler.AutomaticDecompression = $decompression
+
+    $client = [System.Net.Http.HttpClient]::new($handler, $true)
+    $client.Timeout = [timespan]::FromSeconds($RequestTimeoutSeconds)
+    $client.DefaultRequestHeaders.UserAgent.ParseAdd($UserAgent)
+    $client.DefaultRequestHeaders.Accept.ParseAdd('text/html,application/xhtml+xml;q=0.9,*/*;q=0.5')
+    $client.DefaultRequestHeaders.AcceptLanguage.ParseAdd('en-US,en;q=0.9')
+
+    $script:HttpHandler = $handler
+    $script:HttpClient = $client
+}
+
+function New-GoodreadsRequestMessage {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [uri]$Uri
+    )
+
+    if (-not (Test-AllowedGoodreadsUri -Uri $Uri)) {
+        throw "Refusing request to disallowed URI '$Uri'."
+    }
+
+    $request = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Get, $Uri)
+    $request.Headers.Referrer = [uri]'https://www.goodreads.com/'
+    return $request
+}
+
+function Invoke-GoodreadsTextRequest {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [uri]$Uri,
+
+        [Parameter(Mandatory)]
+        [string]$Purpose
+    )
+
+    $currentUri = $Uri
+    $attempt = 0
+    $redirects = 0
+
+    while ($true) {
+        Wait-ForRequestSlot
+        $request = New-GoodreadsRequestMessage -Uri $currentUri
+        $response = $null
+
         try {
-            $details = Get-BookPageDetails -BookUrl $b.Url
-            $finalTitle = if ($details.Title -and $details.Title -notmatch '^(?i)goodreads\b') { $details.Title } else { $b.TitleRow }
+            Write-RunLog -Level DEBUG -Message "GET $Purpose ($currentUri)"
+            $response = $script:HttpClient.SendAsync(
+                $request,
+                [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead
+            ).GetAwaiter().GetResult()
 
-            # Apply exclusions (full & simplified title)
-            $excluded = $false
-            if ($titleBanSet) {
-                $tFull   = Normalize-Key $finalTitle
-                $tSimple = Normalize-Key (Simplify-Title $finalTitle)
-                if ($titleBanSet.Contains($tFull) -or $titleBanSet.Contains($tSimple)) { $excluded = $true }
-            }
-            if ($excluded) { continue }
-
-            $year = if ($details.PubYear) { $details.PubYear } else { $b.PubYear }
-            if (-not $year) { $year = [int]::MaxValue }
-
-            # Category label (not used in thresholds)
-            $isNF = $false
-            if ($details.Genres -contains 'Nonfiction' -or $details.GenresHaystack -match '(?i)\bnon[- ]?fiction\b') { $isNF = $true }
-
-            $avgRating   = if ($details.AvgRating -ne $null) { [math]::Round([double]$details.AvgRating,3) } else { $null }
-            $reviewCount = $details.ReviewCount
-
-            $collected.Add([pscustomobject]@{
-                Author            = $AuthorName
-                AuthorGenreGroup  = $AuthorGenreGroup
-                AuthorGenre       = $AuthorGenreDisplay
-                Title             = $finalTitle
-                Url               = $b.Url
-                Category          = if ($isNF) { 'Non-fiction' } else { 'Fiction' }
-                AvgRating         = $avgRating
-                ReviewCount       = if ($reviewCount -ne $null) { [int]$reviewCount } else { $null }
-                PubYear           = $year
-                SeriesName        = $b.SeriesName
-                SeriesNum         = $b.SeriesNum
-                Pages             = $details.Pages
-                AgeCategory       = $details.AgeCategory
-            })
-        } catch { }
-        Start-Sleep -Milliseconds (Get-Random -Min 800 -Max 1600)
-    }
-    if ($ShowProgress) { Write-Progress -Id 12 -Activity "Fetching book pages ($AuthorName)" -Completed }
-    if ($collected.Count -eq 0) { return @() }
-
-    # ── compute earliest year per block (series or stand-alone) ─────────
-    $firstYear=@{}
-    foreach ($b in $collected) {
-        $key = if ($b.SeriesName) { "$AuthorName|$($b.SeriesName)" } else { "$AuthorName|$($b.Title)" }
-        if (-not $firstYear.ContainsKey($key) -or $firstYear[$key] -gt $b.PubYear) { $firstYear[$key]=$b.PubYear }
-    }
-    foreach ($b in $collected) {
-        $key = if ($b.SeriesName) { "$AuthorName|$($b.SeriesName)" } else { "$AuthorName|$($b.Title)" }
-        $b | Add-Member -NotePropertyName BlockStartYear -NotePropertyValue $firstYear[$key]
-        if ($b.SeriesName -and $b.SeriesNum -eq $null) { } else { if (-not $b.SeriesName) { $b | Add-Member -Force SeriesNum ([double]::PositiveInfinity) } }
-    }
-
-    ,$collected
-}
-
-# ── gather inputs (capture raw & normalized genre) ──────────────────────
-$inputSpecs = New-Object System.Collections.Generic.List[pscustomobject]
-
-# From params
-if ($Author) { foreach($a in $Author){ if ($a) { $inputSpecs.Add([pscustomobject]@{ Author=$a; Url=$null; Genre=$null }) } } }
-if ($Url)    { foreach($u in $Url)   { if ($u) { $inputSpecs.Add([pscustomobject]@{ Author=$null; Url=$u; Genre=$null }) } } }
-
-# From CSV
-if ($InCsv) {
-    try { $rows = Import-Csv -Path $InCsv } catch { Write-Error "Failed to read CSV '$InCsv': $($_.Exception.Message)"; return }
-    foreach ($row in $rows) {
-        $genreProp = ($row.PSObject.Properties.Name | Where-Object { $_ -match '^(?i)(genre|genres|category|categories)$' } | Select-Object -First 1)
-        $genreVal  = if ($genreProp) { $row.$genreProp } else { $null }
-
-        $authorFields = @('Author','Authors','Name')
-        foreach ($f in $authorFields) {
-            if ($row.PSObject.Properties.Name -contains $f -and $row.$f) {
-                foreach ($a in ($row.$f -split '[,;]' | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
-                    $inputSpecs.Add([pscustomobject]@{ Author=$a; Url=$null; Genre=$genreVal })
+            $status = [int]$response.StatusCode
+            if ($status -in @(301, 302, 303, 307, 308)) {
+                if ($redirects -ge 5 -or $null -eq $response.Headers.Location) {
+                    throw "Too many or invalid redirects while requesting $Purpose."
                 }
-            }
-        }
 
-        $urlFields = @('Url','URL','ListUrl','AuthorUrl','AuthorURL')
-        foreach ($f in $urlFields) {
-            if ($row.PSObject.Properties.Name -contains $f -and $row.$f) {
-                foreach ($u in ($row.$f -split '[,;]' | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
-                    $inputSpecs.Add([pscustomobject]@{ Author=$null; Url=$u; Genre=$genreVal })
-                }
-            }
-        }
-    }
-}
-
-if ($inputSpecs.Count -eq 0) { Write-Warning "No authors or URLs found after parsing inputs."; return }
-
-# ── build exclusion map (author -> set of titles) ───────────────────────
-$exclusionMap = @{}
-if ($ExcludeCsv) {
-    try {
-        $exRows = Import-Csv -Path $ExcludeCsv
-        foreach ($r in $exRows) {
-            $aProp = ($r.PSObject.Properties.Name | Where-Object { $_ -match '^(?i)(author|authors|name)$' } | Select-Object -First 1)
-            $tProp = ($r.PSObject.Properties.Name | Where-Object { $_ -match '^(?i)(title|book|booktitle)$' } | Select-Object -First 1)
-            if (-not $aProp -or -not $tProp) { continue }
-            $aName = [string]$r.$aProp
-            $title = [string]$r.$tProp
-            if (-not $aName -or -not $title) { continue }
-
-            $aKey = Normalize-Key $aName
-            if (-not $exclusionMap.ContainsKey($aKey)) {
-                $exclusionMap[$aKey] = New-Object System.Collections.Generic.HashSet[string] ([System.StringComparer]::OrdinalIgnoreCase)
-            }
-            $set = $exclusionMap[$aKey]
-            [void]$set.Add((Normalize-Key $title))
-            [void]$set.Add((Normalize-Key (Simplify-Title $title)))
-        }
-    } catch {
-        Write-Warning "Failed to read exclusion CSV '$ExcludeCsv': $($_.Exception.Message)"
-    }
-}
-
-# ── build worklist (resolve templates, attach both genre forms) ─────────
-$work = New-Object System.Collections.Generic.List[pscustomobject]
-$seenTemplates = @{}
-
-foreach ($spec in $inputSpecs) {
-    try {
-        $tmpl = if ($spec.Author) { Resolve-GoodreadsAuthorListBaseUrl -Author $spec.Author } else { Resolve-GoodreadsAuthorListBaseUrl -Url $spec.Url }
-        if (-not $seenTemplates.ContainsKey($tmpl)) {
-            $aid  = Get-AuthorIdFromListTemplate $tmpl
-            $name = if ($aid) { Get-AuthorDisplayNameById -AuthorId $aid } else { if ($spec.Author) { $spec.Author } else { "Author from URL" } }
-            $genreRaw   = $spec.Genre
-            $genreGroup = Normalize-Genre $genreRaw
-            $genreDisp  = if ($genreGroup -eq 'Other' -and $genreRaw) { $genreRaw } else { $genreGroup }
-            $work.Add([pscustomobject]@{ Template=$tmpl; AuthorId=$aid; AuthorName=$name; GenreGroup=$genreGroup; GenreDisplay=$genreDisp })
-            $seenTemplates[$tmpl] = $true
-        }
-    } catch {
-        $who = if ($spec.Author){$spec.Author}else{$spec.Url}
-        Write-Warning "Skipping '$who': $($_.Exception.Message)"
-    }
-}
-
-if ($work.Count -eq 0) { Write-Warning "Nothing to process after resolving authors/urls."; return }
-
-# ── scrape all requested authors ────────────────────────────────────────
-$all = New-Object System.Collections.Generic.List[object]
-foreach ($w in $work) {
-    $items = Get-BooksForAuthor -BaseTemplate $w.Template -AuthorName $w.AuthorName -AuthorGenreGroup $w.GenreGroup -AuthorGenreDisplay $w.GenreDisplay -ExclusionMap $exclusionMap -ShowProgress:$ShowProgress
-    foreach ($it in $items) { [void]$all.Add($it) }
-}
-if ($all.Count -eq 0) { Write-Warning "No books fetched across all authors."; return }
-
-# ── SERIES/STANDALONE GATING (your algorithm) ───────────────────────────
-
-# Build series avg + first-book review-count maps
-$seriesInfo = @{}
-$seriesGroups = $all | Where-Object { $_.SeriesName } |
-    Group-Object { "{0}|{1}" -f $_.Author, $_.SeriesName }
-
-foreach ($g in $seriesGroups) {
-    $avgRaw = (($g.Group | Where-Object { $_.AvgRating -ne $null } | Measure-Object -Property AvgRating -Average).Average)
-    $avg = if ($avgRaw -is [double]) { [math]::Round([double]$avgRaw,3) } else { $null }
-
-    # Find "first book": prefer smallest numeric SeriesNum; fallback to earliest PubYear
-    $withNum = $g.Group | Where-Object { $_.SeriesNum -ne $null -and -not [double]::IsInfinity($_.SeriesNum) }
-    $first = if ($withNum.Count -gt 0) {
-        $withNum | Sort-Object @{e='SeriesNum'; Ascending=$true}, @{e='PubYear'; Ascending=$true} | Select-Object -First 1
-    } else {
-        $g.Group | Sort-Object @{e='PubYear'; Ascending=$true}, @{e='Title'; Ascending=$true} | Select-Object -First 1
-    }
-
-    $firstRC = if ($first.ReviewCount -ne $null) { [int]$first.ReviewCount } else { 0 }
-    $qualify = ($avg -ne $null -and $avg -ge 4.0 -and $firstRC -ge 1000)
-
-    $seriesInfo[$g.Name] = [pscustomobject]@{
-        SeriesAvg = $avg
-        FirstReviews = $firstRC
-        Qualifies = $qualify
-    }
-}
-
-# Filter into final list
-$final = New-Object System.Collections.Generic.List[object]
-foreach ($row in $all) {
-    if ($row.SeriesName) {
-        $key = "{0}|{1}" -f $row.Author, $row.SeriesName
-        if ($seriesInfo.ContainsKey($key) -and $seriesInfo[$key].Qualifies) {
-            $row | Add-Member -NotePropertyName SeriesAvgRating -NotePropertyValue $seriesInfo[$key].SeriesAvg -Force
-            [void]$final.Add($row)
-        }
-    } else {
-        if ($row.AvgRating -ne $null -and $row.AvgRating -ge 4.0 -and $row.ReviewCount -ne $null -and $row.ReviewCount -ge 1000) {
-            $row | Add-Member -NotePropertyName SeriesAvgRating -NotePropertyValue $null -Force
-            [void]$final.Add($row)
-        }
-    }
-}
-
-if ($final.Count -eq 0) { Write-Warning "No books passed the series/standalone gate."; return }
-
-# ── compute per-author averages and attach Genre ────────────────────────
-$authorSummary = New-Object System.Collections.Generic.List[object]
-$groups = $final | Group-Object Author
-$authorAvgMap = @{}; $authorGenreMap=@{}; $authorGenreGroupMap=@{}
-
-foreach ($g in $groups) {
-    $avg = $null
-    $avgRaw = (($g.Group | Where-Object { $_.AvgRating -ne $null } | Measure-Object -Property AvgRating -Average).Average)
-    if ($avgRaw -is [double]) { $avg = [math]::Round($avgRaw, 3) }
-    $agDisp  = ($g.Group | Select-Object -ExpandProperty AuthorGenre -First 1);        if (-not $agDisp)  { $agDisp  = 'Other' }
-    $agGroup = ($g.Group | Select-Object -ExpandProperty AuthorGenreGroup -First 1);    if (-not $agGroup) { $agGroup = 'Other' }
-    $authorAvgMap[$g.Name]        = $avg
-    $authorGenreMap[$g.Name]      = $agDisp
-    $authorGenreGroupMap[$g.Name] = $agGroup
-    $authorSummary.Add([pscustomobject]@{ Author=$g.Name; GenreDisplay=$agDisp; GenreGroup=$agGroup; Books=$g.Count; AuthorAvg=$avg }) | Out-Null
-}
-
-foreach ($row in $final) {
-    $row | Add-Member -NotePropertyName AuthorAvg -NotePropertyValue $authorAvgMap[$row.Author] -Force
-    if (-not $row.PSObject.Properties.Match('AuthorGenre'))       { $row | Add-Member -NotePropertyName AuthorGenre       -NotePropertyValue ($authorGenreMap[$row.Author]) -Force }
-    if (-not $row.PSObject.Properties.Match('AuthorGenreGroup'))  { $row | Add-Member -NotePropertyName AuthorGenreGroup  -NotePropertyValue ($authorGenreGroupMap[$row.Author]) -Force }
-}
-
-# ── build interleaved author order with arrays ──────────────────────────
-function Sort-ByAvgDesc {
-    param($seq)
-    $seq | Sort-Object `
-        @{ Expression = { if ($_.AuthorAvg -eq $null) { [double]::NegativeInfinity } else { [double]$_.AuthorAvg } }; Descending = $true }, `
-        @{ Expression = 'Author' ; Descending = $false }
-}
-
-$fantasyList = Sort-ByAvgDesc ($authorSummary | Where-Object { $_.GenreGroup -eq 'Fantasy' })
-$scifiList   = Sort-ByAvgDesc ($authorSummary | Where-Object { $_.GenreGroup -eq 'Science-Fiction' })
-$otherList   = Sort-ByAvgDesc ($authorSummary | Where-Object { $_.GenreGroup -eq 'Other' })
-
-$script:fi  = 0
-$script:sfi = 0
-$script:oi  = 0
-
-function Take-FromGenre {
-    param([ValidateSet('Fantasy','Science-Fiction','Other')] [string]$Genre)
-    switch ($Genre) {
-        'Fantasy' {
-            if ($script:fi -lt $fantasyList.Count) { $item = $fantasyList[$script:fi]; $script:fi++; return $item }
-        }
-        'Science-Fiction' {
-            if ($script:sfi -lt $scifiList.Count) { $item = $scifiList[$script:sfi]; $script:sfi++; return $item }
-        }
-        'Other' {
-            if ($script:oi -lt $otherList.Count) { $item = $otherList[$script:oi]; $script:oi++; return $item }
-        }
-    }
-    return $null
-}
-function Take-Any {
-    $x = Take-FromGenre 'Fantasy'         ; if ($x) { return $x }
-    $x = Take-FromGenre 'Science-Fiction' ; if ($x) { return $x }
-    $x = Take-FromGenre 'Other'           ; if ($x) { return $x }
-    return $null
-}
-
-$pattern = @('Fantasy','Science-Fiction','Fantasy','Other')
-$authorInterleaved = New-Object System.Collections.Generic.List[object]
-$idx = 0
-
-while ($script:fi -lt $fantasyList.Count -or $script:sfi -lt $scifiList.Count -or $script:oi -lt $otherList.Count) {
-    $want = $pattern[$idx % $pattern.Count]
-    $picked = Take-FromGenre $want
-    if (-not $picked) { $picked = Take-Any }
-    if ($picked) { $authorInterleaved.Add($picked) }
-    $idx++
-}
-
-for ($i=0; $i -lt $authorInterleaved.Count; $i++) { $authorInterleaved[$i] | Add-Member -NotePropertyName Row -NotePropertyValue ($i+1) -Force }
-
-$authorOrder = @{}; for ($i=0; $i -lt $authorInterleaved.Count; $i++) { $authorOrder[$authorInterleaved[$i].Author] = $i }
-
-# ── final sort for detailed book rows ───────────────────────────────────
-$sorted = $final |
-Sort-Object `
-    @{Expression = { $authorOrder[$_.Author] } ; Ascending = $true}, `
-    @{Expression = 'BlockStartYear'            ; Ascending = $true}, `
-    @{Expression = { if ($_.SeriesName) { $_.SeriesName } else { $_.Title } } ; Ascending = $true}, `
-    @{Expression = 'SeriesNum'                 ; Ascending = $true}, `
-    @{Expression = 'PubYear'                   ; Ascending = $true}, `
-    @{Expression = 'Title'                     ; Ascending = $true}
-
-# ── reading schedule helpers ────────────────────────────────────────────
-function Test-IsReadingDay([datetime]$d){
-    # Reading days: Sunday (0) through Thursday (4)
-    return ($d.DayOfWeek -in @([System.DayOfWeek]::Sunday,[System.DayOfWeek]::Monday,[System.DayOfWeek]::Tuesday,[System.DayOfWeek]::Wednesday,[System.DayOfWeek]::Thursday))
-}
-function Get-FirstReadingDayOnOrAfter([datetime]$d){
-    $x = $d
-    while (-not (Test-IsReadingDay $x)) { $x = $x.AddDays(1) }
-    return $x
-}
-function Get-CompletionDate([datetime]$start,[int]$pages){
-    if ($pages -le 0) { return $null }
-    $readDays = [math]::Ceiling($pages / 20.0)
-    $d = Get-FirstReadingDayOnOrAfter $start
-    $remaining = $readDays - 1  # consume the starting reading day
-    while ($remaining -gt 0) {
-        $d = $d.AddDays(1)
-        if (Test-IsReadingDay $d) { $remaining-- }
-    }
-    return $d
-}
-# Start the next book on the **second Sunday** after the previous completion date
-function Get-SecondSundayAfter([datetime]$date){
-    $dow = [int]$date.DayOfWeek
-    $sunday = [int][System.DayOfWeek]::Sunday
-    $daysAhead = ($sunday - $dow + 7) % 7
-    if ($daysAhead -eq 0) { $daysAhead = 7 }     # strictly after
-    $nextSunday = $date.AddDays($daysAhead)
-    return $nextSunday.AddDays(7)                # second Sunday after
-}
-
-# ── compute schedule columns (Estimated Start/Completion) ───────────────
-foreach ($row in $sorted) {
-    $row | Add-Member -NotePropertyName EstimatedStartDate      -NotePropertyValue $null -Force
-    $row | Add-Member -NotePropertyName EstimatedCompletionDate -NotePropertyValue $null -Force
-}
-
-# cutoff: stop populating once a book's Estimated Completion enters (RunYear + 2)
-$runYear    = (Get-Date).Year
-$cutoffYear = $runYear + 2
-
-if ($FirstStartDate) {
-    $prevCompletion = $null
-    $firstAssigned = $false
-    $stopScheduling = $false
-
-    foreach ($row in $sorted) {
-        if ($stopScheduling) { continue }
-
-        if ($row.Pages -and [int]$row.Pages -gt 0) {
-            $estStart = $null
-            if (-not $firstAssigned) {
-                $estStart = [datetime]$FirstStartDate
-                $firstAssigned = $true
-            } elseif ($prevCompletion) {
-                $estStart = Get-SecondSundayAfter -date $prevCompletion
-            } else {
-                $estStart = [datetime]$FirstStartDate
-            }
-
-            $estCompletion = Get-CompletionDate -start $estStart -pages ([int]$row.Pages)
-
-            # If the completion reaches the cutoff year (e.g., 2027 when running in 2025),
-            # do not populate this book or any following books.
-            if ($estCompletion -and $estCompletion.Year -ge $cutoffYear) {
-                $stopScheduling = $true
+                $currentUri = Resolve-GoodreadsRedirect -CurrentUri $currentUri -Location $response.Headers.Location
+                $redirects++
                 continue
             }
 
-            $row.EstimatedStartDate      = $estStart
-            $row.EstimatedCompletionDate = $estCompletion
-            $prevCompletion = $estCompletion
+            $challenge = Test-GoodreadsChallengeResponse -Response $response
+            if ($status -eq 200 -and -not $challenge) {
+                $body = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+                if ([string]::IsNullOrWhiteSpace($body)) {
+                    throw "Goodreads returned an empty response for $Purpose."
+                }
+                Register-GoodreadsSuccess
+                return $body
+            }
+
+            $transient = $challenge -or $status -in @(202, 408, 425, 429, 500, 502, 503, 504)
+            if (-not $transient -or $attempt -ge $MaxRetries) {
+                throw "Goodreads returned HTTP $status for $Purpose."
+            }
+
+            if ($challenge -or $status -eq 429) {
+                Register-GoodreadsThrottle
+            }
+            $attempt++
+            $delay = Get-RetryDelay -Attempt $attempt -Response $response
+            Write-RunLog -Level WARN -Message "HTTP $status for $Purpose; retry $attempt/$MaxRetries in $delay ms."
+            Start-Sleep -Milliseconds $delay
+        }
+        catch {
+            if ($attempt -ge $MaxRetries -or $_.Exception.Message -match '^Goodreads returned HTTP (?!408|425|429|500|502|503|504)') {
+                throw
+            }
+
+            $attempt++
+            $delay = Get-RetryDelay -Attempt $attempt -Response $response
+            Write-RunLog -Level WARN -Message "Request failed for ${Purpose}: $($_.Exception.Message); retry $attempt/$MaxRetries in $delay ms."
+            Start-Sleep -Milliseconds $delay
+        }
+        finally {
+            if ($null -ne $response) {
+                $response.Dispose()
+            }
+            $request.Dispose()
         }
     }
-} elseif ($PSBoundParameters.ContainsKey('FirstStartDate')) {
-    Write-Warning "FirstStartDate was provided but empty; schedule columns will be blank."
 }
 
-# ── AUTHOR RANKING (interleaved) ────────────────────────────────────────
-"`nAuthor ranking (pattern: Row 1 F, 2 SF, 3 F, 4 Other; then repeat):`n" | Write-Host
-$authorInterleaved |
-Select-Object `
-    @{l='Row'       ; e={ $_.Row }}, `
-    @{l='Author'    ; e={ $_.Author }}, `
-    @{l='Genre'     ; e={ $_.GenreDisplay }}, `
-    @{l='Books'     ; e={ $_.Books }}, `
-    @{l='AuthorAvg' ; e={ if ($_.AuthorAvg -ne $null) { '{0:N3}' -f [double]$_.AuthorAvg } else { $null } }} |
-Format-Table -AutoSize
+function Read-ResponsePrefix {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [System.Net.Http.HttpResponseMessage]$Response,
 
-# ── DETAILED BOOK ROWS (console) ────────────────────────────────────────
-$tableRows = $sorted |
-Select-Object `
-    @{Label='Author'     ; Expression = { $_.Author }}, `
-    @{Label='Genre'      ; Expression = { $_.AuthorGenre }}, `
-    @{Label='AuthorAvg'  ; Expression = { if ($_.AuthorAvg -ne $null) { '{0:N3}' -f [double]$_.AuthorAvg } else { $null } }}, `
-    @{Label='Title'      ; Expression = { $_.Title }}, `
-    @{Label='SeriesName' ; Expression = { $_.SeriesName }}, `
-    @{Label='SeriesNum'  ; Expression = { if ([double]::IsInfinity($_.SeriesNum)) { $null } else { $_.SeriesNum } }}, `
-    @{Label='SeriesAvg'  ; Expression = { if ($_.SeriesAvgRating -ne $null) { '{0:N3}' -f [double]$_.SeriesAvgRating } else { $null } }}, `
-    @{Label='PubYear'    ; Expression = { if ($_.PubYear -eq [int]::MaxValue) { $null } else { $_.PubYear } }}, `
-    @{Label='Pages'      ; Expression = { $_.Pages }}, `
-    @{Label='AgeCategory'; Expression = { $_.AgeCategory }}, `
-    @{Label='AvgRating'  ; Expression = { if ($_.AvgRating -ne $null) { '{0:N3}' -f [double]$_.AvgRating } else { $null } }}, `
-    @{Label='ReviewCount'; Expression = { if ($_.ReviewCount -ne $null) { '{0:N0}' -f [int]$_.ReviewCount } else { $null } }}, `
-    @{Label='EstStart'   ; Expression = { if ($_.EstimatedStartDate) { $_.EstimatedStartDate.ToString('yyyy-MM-dd') } else { $null } }}, `
-    @{Label='EstComplete'; Expression = { if ($_.EstimatedCompletionDate) { $_.EstimatedCompletionDate.ToString('yyyy-MM-dd') } else { $null } }}, `
-    @{Label='Url'        ; Expression = { $_.Url }}
+        [ValidateRange(32768, 1048576)]
+        [int]$MaximumCharacters = 262144
+    )
 
-$tableRows | Format-Table -AutoSize -Wrap
+    $stream = $Response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+    $reader = [System.IO.StreamReader]::new($stream, [System.Text.Encoding]::UTF8, $true, 8192, $false)
+    $builder = [System.Text.StringBuilder]::new([math]::Min($MaximumCharacters, 65536))
+    $buffer = [char[]]::new(8192)
 
-# ── CSV rows (single file only) ─────────────────────────────────────────
-$csvRows = $sorted |
-Select-Object `
-    @{Name='Rank'       ; Expression = { $authorOrder[$_.Author] + 1 }}, `
-    @{Name='Author'     ; Expression = { $_.Author }}, `
-    @{Name='Genre'      ; Expression = { $_.AuthorGenre }}, `
-    @{Name='AuthorAvg'  ; Expression = { if ($_.AuthorAvg -ne $null) { [math]::Round([double]$_.AuthorAvg,3) } else { $null } }}, `
-    @{Name='Title'      ; Expression = { $_.Title }}, `
-    @{Name='SeriesName' ; Expression = { $_.SeriesName }}, `
-    @{Name='SeriesNum'  ; Expression = { if ([double]::IsInfinity($_.SeriesNum) -or $null -eq $_.SeriesNum) { $null } else { $_.SeriesNum } }}, `
-    @{Name='SeriesAvg'  ; Expression = { if ($_.SeriesAvgRating -ne $null) { [math]::Round([double]$_.SeriesAvgRating,3) } else { $null } }}, `
-    @{Name='PubYear'    ; Expression = { if ($_.PubYear -eq [int]::MaxValue) { $null } else { $_.PubYear } }}, `
-    @{Name='Pages'      ; Expression = { if ($_.Pages) { [int]$_.Pages } else { $null } }}, `
-    @{Name='AgeCategory'; Expression = { $_.AgeCategory }}, `
-    @{Name='AvgRating'  ; Expression = { if ($_.AvgRating -ne $null) { [math]::Round([double]$_.AvgRating,3) } else { $null } }}, `
-    @{Name='ReviewCount'; Expression = { if ($_.ReviewCount -ne $null) { [int]$_.ReviewCount } else { $null } }}, `
-    @{Name='EstimatedStartDate'     ; Expression = { if ($_.EstimatedStartDate) { $_.EstimatedStartDate.ToString('yyyy-MM-dd') } else { $null } }}, `
-    @{Name='EstimatedCompletionDate'; Expression = { if ($_.EstimatedCompletionDate) { $_.EstimatedCompletionDate.ToString('yyyy-MM-dd') } else { $null } }}, `
-    @{Name='Url'        ; Expression = { $_.Url }}
-
-if ($OutCsv) {
     try {
-        $dir = Split-Path -Parent $OutCsv
-        if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
-        $csvRows | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $OutCsv
-        Write-Host "Saved CSV to: $OutCsv"
-    } catch {
-        Write-Warning "Failed to write CSV: $($_.Exception.Message)"
+        while ($builder.Length -lt $MaximumCharacters) {
+            $remaining = $MaximumCharacters - $builder.Length
+            $toRead = [math]::Min($buffer.Length, $remaining)
+            $count = $reader.Read($buffer, 0, $toRead)
+            if ($count -le 0) {
+                break
+            }
+
+            [void]$builder.Append($buffer, 0, $count)
+            $current = $builder.ToString()
+            if ($current.Contains('application/ld+json', [System.StringComparison]::OrdinalIgnoreCase) -and
+                $current.Contains('data-testid="bookTitle"', [System.StringComparison]::OrdinalIgnoreCase) -and
+                $current.Contains('</h1>', [System.StringComparison]::OrdinalIgnoreCase)) {
+                break
+            }
+        }
+
+        return $builder.ToString()
+    }
+    finally {
+        $reader.Dispose()
+    }
+}
+
+function ConvertFrom-BookDetailHtml {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Html,
+
+        [Parameter(Mandatory)]
+        [string]$BookId
+    )
+
+    $jsonLdMatch = [regex]::Match(
+        $Html,
+        '(?is)<script\b(?=[^>]*\btype=["'']application/ld\+json["''])[^>]*>(?<json>.*?)</script>'
+    )
+    if (-not $jsonLdMatch.Success) {
+        throw "No Book JSON-LD metadata was found."
+    }
+
+    try {
+        $schema = $jsonLdMatch.Groups['json'].Value | ConvertFrom-Json -Depth 32
+    }
+    catch {
+        throw "Book JSON-LD was invalid: $($_.Exception.Message)"
+    }
+
+    if ($schema -is [array]) {
+        $schema = @($schema | Where-Object { (Get-ObjectPropertyValue -InputObject $_ -Name '@type') -eq 'Book' }) |
+            Select-Object -First 1
+    }
+    if ($null -eq $schema -or (Get-ObjectPropertyValue -InputObject $schema -Name '@type') -ne 'Book') {
+        throw "JSON-LD did not contain a Book object."
+    }
+
+    $pages = 0
+    $pageValue = Get-ObjectPropertyValue -InputObject $schema -Name 'numberOfPages'
+    if ($null -ne $pageValue) {
+        [void][int]::TryParse([string]$pageValue, [ref]$pages)
+    }
+    if ($pages -lt 1 -or $pages -gt 100000) {
+        $pages = 0
+    }
+
+    $authorIds = [System.Collections.Generic.List[string]]::new()
+    $schemaAuthors = Get-ObjectPropertyValue -InputObject $schema -Name 'author'
+    foreach ($authorNode in @($schemaAuthors)) {
+        $authorUrl = Get-ObjectPropertyValue -InputObject $authorNode -Name 'url'
+        if ($null -eq $authorNode -or [string]::IsNullOrWhiteSpace([string]$authorUrl)) {
+            continue
+        }
+
+        $authorMatch = [regex]::Match([string]$authorUrl, '/author/show/(?<id>\d+)', 'IgnoreCase')
+        if ($authorMatch.Success -and -not $authorIds.Contains($authorMatch.Groups['id'].Value)) {
+            [void]$authorIds.Add($authorMatch.Groups['id'].Value)
+        }
+    }
+
+    $seriesId = ''
+    $seriesName = ''
+    $seriesNumber = ''
+    $seriesMatch = [regex]::Match(
+        $Html,
+        '(?is)<h3\b(?=[^>]*\baria-label=["'']Book\s+(?<number>.+?)\s+in\s+the\s+(?<series>.+?)\s+series["''])[^>]*>.*?<a\b[^>]*\bhref=["''][^"'']*/series/(?<id>\d+)[^"'']*["''][^>]*>',
+        ([System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [System.Text.RegularExpressions.RegexOptions]::Singleline)
+    )
+    if ($seriesMatch.Success) {
+        $seriesId = $seriesMatch.Groups['id'].Value
+        $seriesName = ConvertFrom-HtmlText $seriesMatch.Groups['series'].Value
+        $seriesNumber = ConvertFrom-HtmlText $seriesMatch.Groups['number'].Value
+    }
+
+    $displayTitle = ''
+    $titleMatch = [regex]::Match(
+        $Html,
+        '(?is)<h1\b(?=[^>]*\bdata-testid=["'']bookTitle["''])[^>]*>(?<title>.*?)</h1>'
+    )
+    if ($titleMatch.Success) {
+        $displayTitle = ConvertFrom-HtmlText $titleMatch.Groups['title'].Value
+    }
+
+    return [pscustomobject]@{
+        BookId       = $BookId
+        Pages        = $pages
+        Format       = [string](Get-ObjectPropertyValue -InputObject $schema -Name 'bookFormat')
+        Language     = [string](Get-ObjectPropertyValue -InputObject $schema -Name 'inLanguage')
+        DetailTitle  = $displayTitle
+        AuthorIds    = @($authorIds)
+        SeriesId     = $seriesId
+        SeriesName   = $seriesName
+        SeriesNumber = $seriesNumber
+    }
+}
+
+function Get-BookDetailMap {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object[]]$Books
+    )
+
+    $results = @{}
+    $pending = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($book in $Books) {
+        $bookId = [string]$book.BookId
+        [void]$pending.Add([pscustomobject]@{
+            BookId       = $bookId
+            Title        = [string]$book.Title
+            Uri          = [uri]("https://www.goodreads.com/book/show/$bookId")
+            Attempt      = 0
+            Redirects    = 0
+        })
+    }
+
+    Write-RunLog -Level INFO -Message "Book details: $($pending.Count) page request(s) required."
+
+    while ($pending.Count -gt 0) {
+        $retryQueue = [System.Collections.Generic.List[object]]::new()
+        $largestRetryDelay = 0
+
+        for ($offset = 0; $offset -lt $pending.Count; $offset += $MaxConcurrency) {
+            $operationCount = [math]::Min($MaxConcurrency, $pending.Count - $offset)
+            $operations = [System.Collections.Generic.List[object]]::new()
+
+            for ($index = 0; $index -lt $operationCount; $index++) {
+                Wait-ForRequestSlot
+                $state = $pending[$offset + $index]
+                $request = New-GoodreadsRequestMessage -Uri $state.Uri
+                try {
+                    $task = $script:HttpClient.SendAsync(
+                        $request,
+                        [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead
+                    )
+                    [void]$operations.Add([pscustomobject]@{
+                        State   = $state
+                        Request = $request
+                        Task    = $task
+                    })
+                }
+                catch {
+                    $request.Dispose()
+                    $state.Attempt++
+                    if ($state.Attempt -le $MaxRetries) {
+                        [void]$retryQueue.Add($state)
+                        $largestRetryDelay = [math]::Max(
+                            $largestRetryDelay,
+                            (Get-RetryDelay -Attempt $state.Attempt -Response $null)
+                        )
+                    }
+                    else {
+                        Write-RunLog -Level ERROR -Message "Book-detail request failed for '$($state.Title)' after retries: $($_.Exception.Message)"
+                    }
+                }
+            }
+
+            foreach ($operation in $operations) {
+                $state = $operation.State
+                $response = $null
+                try {
+                    $response = $operation.Task.GetAwaiter().GetResult()
+                    $status = [int]$response.StatusCode
+
+                    if ($status -in @(301, 302, 303, 307, 308)) {
+                        if ($state.Redirects -ge 5 -or $null -eq $response.Headers.Location) {
+                            throw "Too many or invalid redirects."
+                        }
+
+                        $state.Uri = Resolve-GoodreadsRedirect -CurrentUri $state.Uri -Location $response.Headers.Location
+                        $state.Redirects++
+                        [void]$retryQueue.Add($state)
+                        continue
+                    }
+
+                    $challenge = Test-GoodreadsChallengeResponse -Response $response
+                    if ($status -ne 200 -or $challenge) {
+                        $transient = $challenge -or $status -in @(202, 408, 425, 429, 500, 502, 503, 504)
+                        if ($transient -and $state.Attempt -lt $MaxRetries) {
+                            if ($challenge -or $status -eq 429) {
+                                Register-GoodreadsThrottle
+                            }
+                            $state.Attempt++
+                            [void]$retryQueue.Add($state)
+                            $largestRetryDelay = [math]::Max(
+                                $largestRetryDelay,
+                                (Get-RetryDelay -Attempt $state.Attempt -Response $response)
+                            )
+                            Write-RunLog -Level WARN -Message "HTTP $status for '$($state.Title)'; queued retry $($state.Attempt)/$MaxRetries."
+                            continue
+                        }
+
+                        throw "Goodreads returned HTTP $status."
+                    }
+
+                    $prefix = Read-ResponsePrefix -Response $response
+                    try {
+                        $metadata = ConvertFrom-BookDetailHtml -Html $prefix -BookId $state.BookId
+                    }
+                    catch {
+                        if ($state.Attempt -lt $MaxRetries) {
+                            $state.Attempt++
+                            [void]$retryQueue.Add($state)
+                            $largestRetryDelay = [math]::Max(
+                                $largestRetryDelay,
+                                (Get-RetryDelay -Attempt $state.Attempt -Response $null)
+                            )
+                            Write-RunLog -Level WARN -Message "Could not parse '$($state.Title)': $($_.Exception.Message); queued retry $($state.Attempt)/$MaxRetries."
+                            continue
+                        }
+                        throw
+                    }
+
+                    $results[$state.BookId] = $metadata
+                    Register-GoodreadsSuccess
+                    Write-RunLog -Level DEBUG -Message "Resolved detail metadata for '$($state.Title)' ($($metadata.Pages) pages)."
+                }
+                catch {
+                    if ($state.Attempt -lt $MaxRetries -and
+                        $_.Exception.Message -notmatch '^Goodreads returned HTTP (?!408|425|429|500|502|503|504)') {
+                        $state.Attempt++
+                        [void]$retryQueue.Add($state)
+                        $largestRetryDelay = [math]::Max(
+                            $largestRetryDelay,
+                            (Get-RetryDelay -Attempt $state.Attempt -Response $response)
+                        )
+                        Write-RunLog -Level WARN -Message "Book-detail request failed for '$($state.Title)': $($_.Exception.Message); queued retry $($state.Attempt)/$MaxRetries."
+                    }
+                    else {
+                        Write-RunLog -Level ERROR -Message "No usable detail metadata for '$($state.Title)': $($_.Exception.Message)"
+                    }
+                }
+                finally {
+                    if ($null -ne $response) {
+                        $response.Dispose()
+                    }
+                    $operation.Request.Dispose()
+                }
+            }
+
+        }
+
+        $pending = $retryQueue
+        if ($pending.Count -gt 0 -and $largestRetryDelay -gt 0) {
+            Write-RunLog -Level WARN -Message "Waiting $largestRetryDelay ms before retrying $($pending.Count) book-detail request(s)."
+            Start-Sleep -Milliseconds ([int][math]::Min(30000, $largestRetryDelay))
+        }
+    }
+
+    return $results
+}
+
+function Get-TitleExclusionReason {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Title
+    )
+
+    if ($Title -match '(?i)\b(?:dramati[sz]ed\s+adaptation|audio\s*book|audiobook|audio\s+adaptation|full[- ]cast\s+audio)\b') {
+        return 'Audio or dramatized adaptation'
+    }
+
+    if ($Title -match '(?i)\b(?:box(?:ed)?\s*set|boxset|omnibus|bind[- ]?up|bundle|series\s+collection|collection\s+set|books?\s+collection|complete\s+(?:book\s+)?series|books?\s+(?:set|bundle)|collection\s+#?\d+\s*[-–—]\s*\d+)\b' -or
+        $Title -match '(?i)\bbooks?\s+#?\d+\s*[-–—]\s*\d+\b' -or
+        $Title -match '(?i)#\d+\s*[-–—]\s*\d+\b') {
+        return 'Omnibus, box set, or multi-work collection'
+    }
+
+    return ''
+}
+
+function Split-TitleAndSeries {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$CompleteTitle
+    )
+
+    $match = [regex]::Match(
+        $CompleteTitle,
+        '^(?<title>.+?)\s+\((?<series>.+?)(?:,\s*|\s+)#(?<number>[^()]+)\)\s*$'
+    )
+
+    if ($match.Success) {
+        return [pscustomobject]@{
+            Title        = $match.Groups['title'].Value.Trim()
+            SeriesName   = $match.Groups['series'].Value.Trim()
+            SeriesNumber = $match.Groups['number'].Value.Trim()
+        }
+    }
+
+    return [pscustomobject]@{
+        Title        = $CompleteTitle.Trim()
+        SeriesName   = ''
+        SeriesNumber = ''
+    }
+}
+
+function Get-NormalizedSeriesKey {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [string]$SeriesName
+    )
+
+    if ([string]::IsNullOrWhiteSpace($SeriesName)) {
+        return ''
+    }
+
+    $normalized = $SeriesName.Normalize([System.Text.NormalizationForm]::FormKC)
+    $normalized = $normalized.Replace('&', ' AND ').ToUpperInvariant()
+    return ([regex]::Replace($normalized, '[^\p{L}\p{Nd}]+', ' ')).Trim()
+}
+
+function Get-NormalizedTitleKey {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [string]$Title
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Title)) {
+        return ''
+    }
+
+    $normalized = $Title.Normalize([System.Text.NormalizationForm]::FormKC)
+    return ([regex]::Replace($normalized, '\s+', ' ')).Trim().ToUpperInvariant()
+}
+
+function Get-UniqueTitleBookList {
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$Books,
+
+        [Parameter(Mandatory)]
+        [string]$AuthorName
+    )
+
+    $uniqueBooks = [System.Collections.Generic.List[object]]::new()
+    foreach ($group in ($Books | Group-Object -Property {
+        Get-NormalizedTitleKey -Title ([string]$_.Title)
+    })) {
+        $ordered = @($group.Group | Sort-Object -Property (
+            @{ Expression = 'RatingCount'; Descending = $true },
+            @{ Expression = { [string]::IsNullOrWhiteSpace([string]$_.SeriesName) }; Ascending = $true },
+            @{ Expression = { [long]$_.BookId }; Ascending = $true }
+        ))
+        $selected = $ordered[0]
+
+        # If the highest-count copy omits series metadata, safely retain it from
+        # duplicates only when every series-bearing copy agrees on the series.
+        $seriesDonors = @($ordered | Where-Object {
+            -not [string]::IsNullOrWhiteSpace([string]$_.SeriesName)
+        })
+        if ([string]::IsNullOrWhiteSpace([string]$selected.SeriesName) -and
+            $seriesDonors.Count -gt 0) {
+            $donorKeys = @($seriesDonors | ForEach-Object {
+                Get-NormalizedSeriesKey -SeriesName ([string]$_.SeriesName)
+            } | Select-Object -Unique)
+            if ($donorKeys.Count -eq 1) {
+                $selected.SeriesId = [string]$seriesDonors[0].SeriesId
+                $selected.SeriesName = [string]$seriesDonors[0].SeriesName
+                $selected.SeriesNumber = [string]$seriesDonors[0].SeriesNumber
+            }
+        }
+        elseif ([string]::IsNullOrWhiteSpace([string]$selected.SeriesNumber)) {
+            $selectedSeriesKey = Get-NormalizedSeriesKey -SeriesName ([string]$selected.SeriesName)
+            $numberDonor = @($seriesDonors | Where-Object {
+                (Get-NormalizedSeriesKey -SeriesName ([string]$_.SeriesName)) -eq $selectedSeriesKey -and
+                -not [string]::IsNullOrWhiteSpace([string]$_.SeriesNumber)
+            }) | Select-Object -First 1
+            if ($null -ne $numberDonor) {
+                $selected.SeriesNumber = [string]$numberDonor.SeriesNumber
+            }
+        }
+
+        [void]$uniqueBooks.Add($selected)
+        for ($index = 1; $index -lt $ordered.Count; $index++) {
+            Add-Exclusion -Reason 'Duplicate title' -Author $AuthorName -Title $ordered[$index].Title
+        }
+
+        if ($ordered.Count -gt 1) {
+            Write-RunLog -Level DEBUG -Message (
+                "Duplicate title '$($selected.Title)' for '$AuthorName': kept book $($selected.BookId) with $($selected.RatingCount) ratings; discarded $($ordered.Count - 1) lower-priority copy/copies."
+            )
+        }
+    }
+
+    return @($uniqueBooks)
+}
+
+function Test-PrimaryAuthorRole {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [string]$Role
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Role)) {
+        return $true
+    }
+
+    return $Role.Trim() -match '^(?i:Goodreads Author|Author|Co-Author|Writer|Creator|Story|Primary Contributor|Main Author)$'
+}
+
+function ConvertFrom-AuthorListPage {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Html,
+
+        [Parameter(Mandatory)]
+        [string]$InputAuthorId
+    )
+
+    $authorName = ''
+    $headingMatch = [regex]::Match($Html, '(?is)<h1\b[^>]*>\s*Books\s+by\s+(?<name>.*?)</h1>')
+    if ($headingMatch.Success) {
+        $authorName = ConvertFrom-HtmlText $headingMatch.Groups['name'].Value
+    }
+
+    $rows = [System.Collections.Generic.List[object]]::new()
+    $pageMinimumRatingsCount = [long]::MaxValue
+    $rowMatches = [regex]::Matches(
+        $Html,
+        '(?is)<tr\b[^>]*\bitemtype=["'']http://schema\.org/Book["''][^>]*>(?<row>.*?)</tr>'
+    )
+
+    foreach ($rowMatch in $rowMatches) {
+        $row = $rowMatch.Groups['row'].Value
+        $rowText = ConvertFrom-HtmlText $row
+        $ratingMatch = [regex]::Match(
+            $rowText,
+            '(?<rating>\d+(?:\.\d+)?)\s+avg rating\s+(?:\p{Pd}|-)+\s+(?<count>[\d,]+)\s+ratings?',
+            'IgnoreCase'
+        )
+        $rating = 0.0
+        $ratingCount = [long]0
+        $ratingMetadataValid = $false
+        if ($ratingMatch.Success) {
+            try {
+                $rating = ConvertTo-InvariantNumber -Value $ratingMatch.Groups['rating'].Value -Type Double
+                $ratingCount = ConvertTo-InvariantNumber -Value $ratingMatch.Groups['count'].Value -Type Int64
+                $ratingMetadataValid = $true
+                $pageMinimumRatingsCount = [math]::Min($pageMinimumRatingsCount, $ratingCount)
+            }
+            catch {
+                $ratingMetadataValid = $false
+            }
+        }
+
+        $titleMatch = [regex]::Match(
+            $row,
+            '(?is)<a\b(?=[^>]*\bclass=["''][^"'']*\bbookTitle\b[^"'']*["''])(?=[^>]*\bhref=["''](?<href>[^"'']+)["''])[^>]*>.*?<span\b[^>]*\bitemprop=["'']name["''][^>]*>(?<title>.*?)</span>'
+        )
+        if (-not $titleMatch.Success) {
+            Add-Exclusion -Reason 'Unparseable author-list row' -Author $authorName
+            continue
+        }
+
+        $href = [System.Net.WebUtility]::HtmlDecode($titleMatch.Groups['href'].Value)
+        $bookMatch = [regex]::Match($href, '/book/show/(?<id>\d+)', 'IgnoreCase')
+        if (-not $bookMatch.Success) {
+            Add-Exclusion -Reason 'Missing Goodreads book ID' -Author $authorName
+            continue
+        }
+
+        $completeTitle = ConvertFrom-HtmlText $titleMatch.Groups['title'].Value
+        $titleParts = Split-TitleAndSeries -CompleteTitle $completeTitle
+        $titleReason = Get-TitleExclusionReason -Title $completeTitle
+        if (-not [string]::IsNullOrWhiteSpace($titleReason)) {
+            Add-Exclusion -Reason $titleReason -Author $authorName -Title $completeTitle
+            continue
+        }
+
+        $authorMatches = [regex]::Matches(
+            $row,
+            '(?is)<a\b(?=[^>]*\bclass=["''][^"'']*\bauthorName\b[^"'']*["''])(?=[^>]*\bhref=["''][^"'']*/author/show/(?<id>\d+)[^"'']*["''])[^>]*>.*?<span\b[^>]*\bitemprop=["'']name["''][^>]*>(?<name>.*?)</span>.*?</a>(?<after>.{0,200})'
+        )
+
+        $inputAuthorFound = $false
+        $inputAuthorIsPrimary = $false
+        foreach ($authorMatch in $authorMatches) {
+            if ($authorMatch.Groups['id'].Value -ne $InputAuthorId) {
+                continue
+            }
+
+            $inputAuthorFound = $true
+            $role = ''
+            $roleMatch = [regex]::Match(
+                $authorMatch.Groups['after'].Value,
+                '(?is)<span\b(?=[^>]*\bclass=["''][^"'']*\brole\b[^"'']*["''])[^>]*>\s*\((?<role>[^)]+)\)\s*</span>',
+                'IgnoreCase'
+            )
+            if (-not $roleMatch.Success) {
+                $roleMatch = [regex]::Match(
+                    $authorMatch.Groups['after'].Value,
+                    '^\s*<span\b[^>]*>\s*\((?<role>[^)]+)\)\s*</span>',
+                    'IgnoreCase'
+                )
+            }
+            if ($roleMatch.Success) {
+                $role = ConvertFrom-HtmlText $roleMatch.Groups['role'].Value
+            }
+
+            if (Test-PrimaryAuthorRole -Role $role) {
+                $inputAuthorIsPrimary = $true
+            }
+            break
+        }
+
+        if (-not $inputAuthorFound -or -not $inputAuthorIsPrimary) {
+            Add-Exclusion -Reason 'Contributor-only credit' -Author $authorName -Title $completeTitle
+            continue
+        }
+
+        if (-not $ratingMatch.Success) {
+            Add-Exclusion -Reason 'Missing rating metadata' -Author $authorName -Title $completeTitle
+            continue
+        }
+        if (-not $ratingMetadataValid) {
+            Add-Exclusion -Reason 'Invalid rating metadata' -Author $authorName -Title $completeTitle
+            continue
+        }
+
+        $publicationYear = 0
+        $yearMatch = [regex]::Match($rowText, '\bpublished\s+(?<year>\d{4})\b', 'IgnoreCase')
+        if (-not $yearMatch.Success -or
+            -not [int]::TryParse($yearMatch.Groups['year'].Value, [ref]$publicationYear)) {
+            Add-Exclusion -Reason 'Missing publication year' -Author $authorName -Title $completeTitle
+            continue
+        }
+
+        $workId = ''
+        $workMatch = [regex]::Match($row, '/work/editions/(?<id>\d+)', 'IgnoreCase')
+        if ($workMatch.Success) {
+            $workId = $workMatch.Groups['id'].Value
+        }
+
+        [void]$rows.Add([pscustomobject]@{
+            AuthorId       = $InputAuthorId
+            Author         = $authorName
+            BookId         = $bookMatch.Groups['id'].Value
+            WorkId         = $workId
+            WorkKey        = if ($workId) { "work:$workId" } else { "book:$($bookMatch.Groups['id'].Value)" }
+            Title          = $titleParts.Title
+            CompleteTitle  = $completeTitle
+            SeriesId       = ''
+            SeriesName     = $titleParts.SeriesName
+            SeriesNumber   = $titleParts.SeriesNumber
+            AverageRating  = [double]$rating
+            RatingCount    = [long]$ratingCount
+            PublicationYear = $publicationYear
+        })
+    }
+
+    $nextHref = ''
+    $nextMatch = [regex]::Match(
+        $Html,
+        '(?is)<a\b(?=[^>]*\bclass=["''][^"'']*\bnext_page\b[^"'']*["''])(?=[^>]*\brel=["'']next["''])(?=[^>]*\bhref=["''](?<href>[^"'']+)["''])[^>]*>'
+    )
+    if ($nextMatch.Success) {
+        $nextHref = [System.Net.WebUtility]::HtmlDecode($nextMatch.Groups['href'].Value)
+    }
+
+    return [pscustomobject]@{
+        AuthorName                  = $authorName
+        Books                       = @($rows)
+        NextHref                    = $nextHref
+        HasBookBelowRatingsThreshold = $pageMinimumRatingsCount -lt [long]$MinimumRatingsCount
+        MinimumPageRatingsCount     = if ($pageMinimumRatingsCount -eq [long]::MaxValue) {
+            $null
+        }
+        else {
+            $pageMinimumRatingsCount
+        }
+    }
+}
+
+function Get-GoodreadsAuthorRecord {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [psobject]$Config
+    )
+
+    $allBooks = [System.Collections.Generic.List[object]]::new()
+    $visited = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $currentUri = [uri]$Config.Url
+    $authorName = ''
+    $pageNumber = 1
+    $forceInclude = [bool](Get-ObjectPropertyValue -InputObject $Config -Name 'ForceInclude')
+    $paginationCutoffBypassed = $false
+
+    while ($true) {
+        if (-not $visited.Add($currentUri.AbsoluteUri)) {
+            throw "Pagination loop detected for author ID $($Config.AuthorId)."
+        }
+
+        $html = Invoke-GoodreadsTextRequest -Uri $currentUri -Purpose (
+            "author $($Config.AuthorId), page $pageNumber"
+        )
+
+        $parsed = ConvertFrom-AuthorListPage -Html $html -InputAuthorId $Config.AuthorId
+        if (-not [string]::IsNullOrWhiteSpace($parsed.AuthorName)) {
+            $authorName = $parsed.AuthorName
+        }
+        foreach ($book in $parsed.Books) {
+            $book | Add-Member -NotePropertyName Genre -NotePropertyValue $Config.Genre
+            [void]$allBooks.Add($book)
+        }
+
+        Write-RunLog -Level INFO -Message (
+            "Parsed author $($Config.AuthorId), page ${pageNumber}: $($parsed.Books.Count) eligible row(s)."
+        )
+
+        if ([string]::IsNullOrWhiteSpace($parsed.NextHref)) {
+            break
+        }
+
+        if ($parsed.HasBookBelowRatingsThreshold -and -not $forceInclude) {
+            Write-RunLog -Level INFO -Message (
+                "Stopped pagination for author $($Config.AuthorId) after page ${pageNumber}: lowest listed ratings count $($parsed.MinimumPageRatingsCount) is below threshold $MinimumRatingsCount."
+            )
+            break
+        }
+
+        if ($parsed.HasBookBelowRatingsThreshold -and
+            $forceInclude -and
+            -not $paginationCutoffBypassed) {
+            Write-RunLog -Level INFO -Message (
+                "Continuing pagination for force-included author $($Config.AuthorId) despite a listed ratings count below $MinimumRatingsCount."
+            )
+            $paginationCutoffBypassed = $true
+        }
+
+        $nextUri = [uri]::new($currentUri, $parsed.NextHref)
+        if (-not (Test-AllowedGoodreadsUri -Uri $nextUri) -or
+            $nextUri.AbsolutePath -notmatch "^/author/list/$([regex]::Escape($Config.AuthorId))(?:\.|/|$)") {
+            throw "Unsafe or unexpected pagination link '$nextUri'."
+        }
+
+        $currentUri = $nextUri
+        $pageNumber++
+    }
+
+    if ([string]::IsNullOrWhiteSpace($authorName)) {
+        $authorName = "Goodreads Author $($Config.AuthorId)"
+    }
+
+    # Goodreads advertises distinct works, but defensive work-ID and title
+    # deduplication protects against pagination drift and duplicate editions.
+    $deduplicated = [System.Collections.Generic.List[object]]::new()
+    foreach ($group in ($allBooks | Group-Object -Property WorkKey)) {
+        $selected = @($group.Group | Sort-Object -Property (
+            @{ Expression = 'RatingCount'; Descending = $true },
+            @{ Expression = 'BookId'; Ascending = $true }
+        ))[0]
+        $selected.Author = $authorName
+        [void]$deduplicated.Add($selected)
+
+        if ($group.Count -gt 1) {
+            Add-Exclusion -Reason 'Duplicate Goodreads work' -Author $authorName -Title $selected.Title
+        }
+    }
+
+    $titleDeduplicated = @(Get-UniqueTitleBookList -Books @($deduplicated) -AuthorName $authorName)
+
+    return [pscustomobject]@{
+        AuthorId = $Config.AuthorId
+        Author   = $authorName
+        Genre    = $Config.Genre
+        ForceInclude = $forceInclude
+        Books    = $titleDeduplicated
+    }
+}
+
+function Import-AuthorConfiguration {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$LiteralPath
+    )
+
+    $firstNonBlank = Get-Content -LiteralPath $LiteralPath -TotalCount 20 |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        Select-Object -First 1
+    if ([string]::IsNullOrWhiteSpace($firstNonBlank)) {
+        throw "Input file '$LiteralPath' is empty."
+    }
+
+    $delimiter = if ($firstNonBlank.Contains("`t")) { "`t" } else { ',' }
+    $records = @(Import-Csv -LiteralPath $LiteralPath -Delimiter $delimiter)
+    if ($records.Count -eq 0) {
+        throw "Input file '$LiteralPath' contains no data rows."
+    }
+
+    $headers = @($records[0].PSObject.Properties.Name)
+    $urlHeader = @($headers | Where-Object { $_.Trim() -ieq 'URL' }) | Select-Object -First 1
+    $genreHeader = @($headers | Where-Object { $_.Trim() -ieq 'Genre' }) | Select-Object -First 1
+    $authorHeader = @($headers | Where-Object { $_.Trim() -ieq 'Author' }) | Select-Object -First 1
+    $excludeHeader = @($headers | Where-Object { $_.Trim() -ieq 'Exclude' }) | Select-Object -First 1
+    $includeHeader = @($headers | Where-Object { $_.Trim() -ieq 'Include' }) | Select-Object -First 1
+    if ($null -eq $urlHeader -or $null -eq $genreHeader) {
+        throw "Input must contain URL and Genre columns. Found: $($headers -join ', ')."
+    }
+
+    $configs = [System.Collections.Generic.List[object]]::new()
+    $seenGenres = @{}
+    $seenForceInclude = @{}
+    $excludedRowCount = 0
+    $forceIncludedRowCount = 0
+    $rowNumber = 1
+    foreach ($record in $records) {
+        $rowNumber++
+        $rawUrl = [string]$record.$urlHeader
+        $genre = ([regex]::Replace([string]$record.$genreHeader, '\s+', ' ')).Trim()
+        $excludeValue = if ($null -ne $excludeHeader) {
+            ([string]$record.$excludeHeader).Trim()
+        }
+        else {
+            ''
+        }
+        $includeValue = if ($null -ne $includeHeader) {
+            ([string]$record.$includeHeader).Trim()
+        }
+        else {
+            ''
+        }
+        $excludeRequested = $excludeValue -ieq 'Y'
+        $forceInclude = $includeValue -ieq 'Y'
+
+        if ($excludeRequested -and $forceInclude) {
+            throw "Input row $rowNumber cannot have Y in both Exclude and Include."
+        }
+
+        if ($excludeRequested) {
+            $excludedRowCount++
+            $authorLabel = if ($null -ne $authorHeader) {
+                ([regex]::Replace([string]$record.$authorHeader, '\s+', ' ')).Trim()
+            }
+            else {
+                ''
+            }
+            if ([string]::IsNullOrWhiteSpace($authorLabel)) {
+                $authorLabel = $rawUrl.Trim()
+            }
+            if ([string]::IsNullOrWhiteSpace($authorLabel)) {
+                $authorLabel = "input row $rowNumber"
+            }
+
+            Write-RunLog -Level INFO -Message (
+                "Excluded '$authorLabel' from input row $rowNumber because Exclude=Y; no Goodreads lookup will be performed."
+            )
+            continue
+        }
+
+        if ([string]::IsNullOrWhiteSpace($rawUrl) -and [string]::IsNullOrWhiteSpace($genre)) {
+            continue
+        }
+        if ([string]::IsNullOrWhiteSpace($rawUrl) -or [string]::IsNullOrWhiteSpace($genre)) {
+            throw "Input row $rowNumber must contain both URL and Genre."
+        }
+
+        $normalized = ConvertTo-NormalizedAuthorUrl -Value $rawUrl
+        if ($seenGenres.ContainsKey($normalized.AuthorId)) {
+            if ($seenGenres[$normalized.AuthorId] -ine $genre) {
+                throw "Author ID $($normalized.AuthorId) appears with conflicting genres '$($seenGenres[$normalized.AuthorId])' and '$genre'."
+            }
+            if ([bool]$seenForceInclude[$normalized.AuthorId] -ne $forceInclude) {
+                throw "Author ID $($normalized.AuthorId) appears with conflicting Include values."
+            }
+            Write-RunLog -Level WARN -Message "Ignoring duplicate input row for author ID $($normalized.AuthorId)."
+            continue
+        }
+
+        $seenGenres[$normalized.AuthorId] = $genre
+        $seenForceInclude[$normalized.AuthorId] = $forceInclude
+        [void]$configs.Add([pscustomobject]@{
+            AuthorId    = $normalized.AuthorId
+            Url         = $normalized.Url
+            Genre       = $genre
+            ForceInclude = $forceInclude
+        })
+
+        if ($forceInclude) {
+            $forceIncludedRowCount++
+            $authorLabel = if ($null -ne $authorHeader) {
+                ([regex]::Replace([string]$record.$authorHeader, '\s+', ' ')).Trim()
+            }
+            else {
+                ''
+            }
+            if ([string]::IsNullOrWhiteSpace($authorLabel)) {
+                $authorLabel = $normalized.Url
+            }
+            Write-RunLog -Level INFO -Message (
+                "Force-including '$authorLabel' from input row $rowNumber because Include=Y; ratings-based pagination and filtering will be bypassed."
+            )
+        }
+    }
+
+    if ($excludedRowCount -gt 0) {
+        Write-RunLog -Level INFO -Message "Skipped $excludedRowCount input author row(s) marked Exclude=Y."
+    }
+    if ($forceIncludedRowCount -gt 0) {
+        Write-RunLog -Level INFO -Message "Enabled force-inclusion for $forceIncludedRowCount input author row(s) marked Include=Y."
+    }
+
+    if ($configs.Count -eq 0) {
+        throw 'No valid author rows were found in the input.'
+    }
+
+    return @($configs)
+}
+
+function Test-UsableBookDetail {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [psobject]$Book,
+
+        [Parameter(Mandatory)]
+        [psobject]$Detail
+    )
+
+    if ([int]$Detail.Pages -le 0) {
+        Add-Exclusion -Reason 'Missing usable page count' -Author $Book.Author -Title $Book.Title
+        return $false
+    }
+
+    if ([string]$Detail.Format -match '(?i)\b(?:audio|audible|mp3|cassette|podcast)\b') {
+        Add-Exclusion -Reason 'Audio edition format' -Author $Book.Author -Title $Book.Title
+        return $false
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace([string]$Detail.Language) -and
+        [string]$Detail.Language -notmatch '^(?i:English|en(?:[-_].*)?)$') {
+        Add-Exclusion -Reason 'Non-English translated edition' -Author $Book.Author -Title $Book.Title
+        return $false
+    }
+
+    $detailAuthorIds = @($Detail.AuthorIds | ForEach-Object { [string]$_ })
+    if ($detailAuthorIds.Count -gt 0 -and $Book.AuthorId -notin $detailAuthorIds) {
+        Add-Exclusion -Reason 'Input author absent from canonical edition' -Author $Book.Author -Title $Book.Title
+        return $false
+    }
+
+    return $true
+}
+
+function Get-SeriesNumberSortKey {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [string]$SeriesNumber
+    )
+
+    if ([string]::IsNullOrWhiteSpace($SeriesNumber)) {
+        return '9999999999|'
+    }
+
+    $match = [regex]::Match($SeriesNumber.Trim(), '^(?<number>\d+(?:\.\d+)?)')
+    if ($match.Success) {
+        $number = ConvertTo-InvariantNumber -Value $match.Groups['number'].Value -Type Double
+        return '{0:D10}|{1}' -f [int64][math]::Round($number * 1000), $SeriesNumber.ToUpperInvariant()
+    }
+
+    return '9999999998|' + $SeriesNumber.ToUpperInvariant()
+}
+
+function Get-SeriesFirstBook {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object[]]$Books
+    )
+
+    $numberOne = @($Books | Where-Object {
+        $numeric = 0.0
+        [double]::TryParse(
+            ([string]$_.SeriesNumber).Trim(),
+            [System.Globalization.NumberStyles]::Float,
+            $script:InvariantCulture,
+            [ref]$numeric
+        ) -and [math]::Abs($numeric - 1.0) -lt 0.0000001
+    } | Sort-Object -Property (
+        @{ Expression = 'PublicationYear'; Ascending = $true },
+        @{ Expression = 'Title'; Ascending = $true }
+    ))
+
+    if ($numberOne.Count -gt 0) {
+        return $numberOne[0]
+    }
+
+    return @($Books | Sort-Object -Property (
+        @{ Expression = { Get-SeriesNumberSortKey -SeriesNumber $_.SeriesNumber }; Ascending = $true },
+        @{ Expression = 'PublicationYear'; Ascending = $true },
+        @{ Expression = 'Title'; Ascending = $true }
+    ))[0]
+}
+
+function Get-UnweightedAverage {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object[]]$Values
+    )
+
+    if ($Values.Count -eq 0) {
+        throw 'Cannot calculate an average of zero values.'
+    }
+
+    $sum = 0.0
+    foreach ($value in $Values) {
+        $sum += [double]$value
+    }
+    return $sum / $Values.Count
+}
+
+function Test-PossibleSeriesTitle {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Title
+    )
+
+    return $Title -match '(?i)(?:#\s*\d+(?:\.\d+)?|\b(?:book|vol(?:ume)?|part)\s*[#:]?\s*\d+(?:\.\d+)?\b|\b(?:series|trilogy|saga|cycle)\b)'
+}
+
+function Get-DetailCandidateBookList {
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param(
+        [Parameter(Mandatory)]
+        [object[]]$AuthorRecords
+    )
+
+    $candidates = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($authorRecord in $AuthorRecords) {
+        foreach ($book in $authorRecord.Books) {
+            $book | Add-Member -NotePropertyName PreFilterExcluded -NotePropertyValue $false -Force
+        }
+
+        $forceInclude = [bool](Get-ObjectPropertyValue -InputObject $authorRecord -Name 'ForceInclude')
+        if ($forceInclude) {
+            foreach ($book in $authorRecord.Books) {
+                [void]$candidates.Add($book)
+            }
+            Write-RunLog -Level INFO -Message (
+                "Force-included '$($authorRecord.Author)': bypassed ratings prefilter for $($authorRecord.Books.Count) canonical book(s)."
+            )
+            continue
+        }
+
+        if ($FullMetadataScan) {
+            foreach ($book in $authorRecord.Books) {
+                [void]$candidates.Add($book)
+            }
+            continue
+        }
+
+        $standalones = @($authorRecord.Books | Where-Object {
+            [string]::IsNullOrWhiteSpace([string]$_.SeriesName)
+        })
+        foreach ($standalone in $standalones) {
+            $mayHaveUnparsedSeries = Test-PossibleSeriesTitle -Title ([string]$standalone.CompleteTitle)
+            if (($standalone.AverageRating -ge $MinimumRating -and
+                    $standalone.RatingCount -ge $MinimumRatingsCount) -or
+                $mayHaveUnparsedSeries) {
+                [void]$candidates.Add($standalone)
+                continue
+            }
+
+            $standalone.PreFilterExcluded = $true
+            Add-Exclusion -Reason 'Standalone below rating or ratings-count threshold' -Author $standalone.Author -Title $standalone.Title
+        }
+
+        $seriesBooks = @($authorRecord.Books | Where-Object {
+            -not [string]::IsNullOrWhiteSpace([string]$_.SeriesName)
+        })
+        foreach ($seriesGroup in ($seriesBooks | Group-Object -Property {
+            Get-NormalizedSeriesKey -SeriesName ([string]$_.SeriesName)
+        })) {
+            $books = @($seriesGroup.Group)
+
+            # Detail-page validation can remove a no-page, audio, translated, or
+            # incorrectly attributed edition. A series is therefore rejected here
+            # only when no possible remaining subset could pass both thresholds.
+            $couldMeetAverage = @($books | Where-Object {
+                $_.AverageRating -ge $MinimumRating
+            }).Count -gt 0
+            $couldHaveQualifyingFirstBook = @($books | Where-Object {
+                $_.RatingCount -ge $MinimumRatingsCount
+            }).Count -gt 0
+
+            if ($couldMeetAverage -and $couldHaveQualifyingFirstBook) {
+                foreach ($book in $books) {
+                    [void]$candidates.Add($book)
+                }
+                continue
+            }
+
+            foreach ($book in $books) {
+                $book.PreFilterExcluded = $true
+                Add-Exclusion -Reason 'Series below average or first-book ratings-count threshold' -Author $book.Author -Title $book.Title
+            }
+        }
+    }
+
+    return @($candidates)
+}
+
+function Get-FilteredAuthorResult {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [psobject]$AuthorRecord,
+
+        [Parameter(Mandatory)]
+        [hashtable]$DetailByBookId
+    )
+
+    $forceInclude = [bool](Get-ObjectPropertyValue -InputObject $AuthorRecord -Name 'ForceInclude')
+    $usableBooks = [System.Collections.Generic.List[object]]::new()
+    foreach ($book in $AuthorRecord.Books) {
+        if ([bool](Get-ObjectPropertyValue -InputObject $book -Name 'PreFilterExcluded')) {
+            continue
+        }
+
+        if ($AuthorListOnly) {
+            $book | Add-Member -NotePropertyName Pages -NotePropertyValue $null -Force
+            $book | Add-Member -NotePropertyName SeriesAverage -NotePropertyValue $null -Force
+            [void]$usableBooks.Add($book)
+            continue
+        }
+
+        $bookId = [string]$book.BookId
+        if (-not $DetailByBookId.ContainsKey($bookId)) {
+            Add-Exclusion -Reason 'Book-detail request or parse failure' -Author $book.Author -Title $book.Title
+            continue
+        }
+
+        $detail = $DetailByBookId[$bookId]
+        if (-not (Test-UsableBookDetail -Book $book -Detail $detail)) {
+            continue
+        }
+
+        $book | Add-Member -NotePropertyName Pages -NotePropertyValue ([int]$detail.Pages) -Force
+        if (-not [string]::IsNullOrWhiteSpace([string]$detail.DetailTitle)) {
+            $book.Title = [string]$detail.DetailTitle
+        }
+        $detailSeriesName = [string]$detail.SeriesName
+        if (-not [string]::IsNullOrWhiteSpace($detailSeriesName)) {
+            if ([string]::IsNullOrWhiteSpace([string]$book.SeriesName)) {
+                $book.SeriesId = [string]$detail.SeriesId
+                $book.SeriesName = $detailSeriesName
+                $book.SeriesNumber = [string]$detail.SeriesNumber
+            }
+            elseif ((Get-NormalizedSeriesKey -SeriesName ([string]$book.SeriesName)) -eq
+                (Get-NormalizedSeriesKey -SeriesName $detailSeriesName)) {
+                if ([string]::IsNullOrWhiteSpace([string]$book.SeriesId)) {
+                    $book.SeriesId = [string]$detail.SeriesId
+                }
+                if ([string]::IsNullOrWhiteSpace([string]$book.SeriesNumber)) {
+                    $book.SeriesNumber = [string]$detail.SeriesNumber
+                }
+            }
+            else {
+                Write-RunLog -Level DEBUG -Message (
+                    "Preserved author-list series '$($book.SeriesName)' for '$($book.Title)' instead of overlapping detail-page series '$detailSeriesName'."
+                )
+            }
+        }
+        $book | Add-Member -NotePropertyName SeriesAverage -NotePropertyValue $null -Force
+        [void]$usableBooks.Add($book)
+    }
+
+    # Detail-page display titles can converge even when author-list titles differ.
+    # Recheck here so the final output still contains one title per author.
+    $usableBooks = @(Get-UniqueTitleBookList -Books @($usableBooks) -AuthorName $AuthorRecord.Author)
+
+    $survivors = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($standalone in @($usableBooks | Where-Object { [string]::IsNullOrWhiteSpace($_.SeriesName) })) {
+        if ($forceInclude -or
+            ($standalone.AverageRating -ge $MinimumRating -and
+                $standalone.RatingCount -ge $MinimumRatingsCount)) {
+            [void]$survivors.Add($standalone)
+        }
+        else {
+            Add-Exclusion -Reason 'Standalone below rating or ratings-count threshold' -Author $standalone.Author -Title $standalone.Title
+        }
+    }
+
+    $seriesBooks = @($usableBooks | Where-Object { -not [string]::IsNullOrWhiteSpace($_.SeriesName) })
+    foreach ($seriesGroup in ($seriesBooks | Group-Object -Property {
+        Get-NormalizedSeriesKey -SeriesName ([string]$_.SeriesName)
+    })) {
+        $books = @($seriesGroup.Group)
+        $firstBook = Get-SeriesFirstBook -Books $books
+        $canonicalSeriesName = [string]$firstBook.SeriesName
+        $seriesAverage = Get-UnweightedAverage -Values @($books | ForEach-Object { $_.AverageRating })
+
+        if ($forceInclude -or
+            ($seriesAverage -ge $MinimumRating -and
+                $firstBook.RatingCount -ge $MinimumRatingsCount)) {
+            $roundedSeriesAverage = [math]::Round($seriesAverage, 3, [System.MidpointRounding]::AwayFromZero)
+            foreach ($seriesBook in $books) {
+                $seriesBook.SeriesName = $canonicalSeriesName
+                $seriesBook.SeriesAverage = $roundedSeriesAverage
+                [void]$survivors.Add($seriesBook)
+            }
+        }
+        else {
+            foreach ($seriesBook in $books) {
+                Add-Exclusion -Reason 'Series below average or first-book ratings-count threshold' -Author $seriesBook.Author -Title $seriesBook.Title
+            }
+        }
+    }
+
+    if ($survivors.Count -eq 0) {
+        if ($forceInclude) {
+            Write-RunLog -Level WARN -Message (
+                "Force-inclusion could not retain '$($AuthorRecord.Author)' because no books survived non-rating eligibility checks."
+            )
+        }
+        else {
+            Write-RunLog -Level WARN -Message "No books survived filtering for '$($AuthorRecord.Author)'."
+        }
+        return $null
+    }
+
+    if ($forceInclude) {
+        Write-RunLog -Level INFO -Message (
+            "Force-included '$($AuthorRecord.Author)' with $($survivors.Count) book(s) after non-rating eligibility checks."
+        )
+    }
+
+    $authorAverageRaw = Get-UnweightedAverage -Values @($survivors | ForEach-Object { $_.AverageRating })
+    $authorAverage = [math]::Round($authorAverageRaw, 3, [System.MidpointRounding]::AwayFromZero)
+
+    return [pscustomobject]@{
+        AuthorId      = $AuthorRecord.AuthorId
+        Author        = $AuthorRecord.Author
+        Genre         = $AuthorRecord.Genre
+        ForceInclude  = $forceInclude
+        AuthorAverage = $authorAverage
+        Books         = @($survivors)
+    }
+}
+
+function Get-GenreBucket {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Genre
+    )
+
+    $normalized = ([regex]::Replace($Genre.Trim(), '[-_\s]+', ' ')).ToUpperInvariant()
+    if ($normalized -eq 'FANTASY') {
+        return 'Fantasy'
+    }
+    if ($normalized -in @('SCIENCE FICTION', 'SCI FI', 'SCIFI')) {
+        return 'ScienceFiction'
+    }
+    return 'Other'
+}
+
+function Get-RankedAuthorList {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object[]]$Authors,
+
+        [Parameter(Mandatory)]
+        [ValidateRange(1, 4)]
+        [int]$OrderNumber
+    )
+
+    $buckets = @{
+        Fantasy       = @()
+        ScienceFiction = @()
+        Other          = @()
+    }
+
+    foreach ($author in $Authors) {
+        $bucketName = Get-GenreBucket -Genre $author.Genre
+        $buckets[$bucketName] += $author
+    }
+
+    foreach ($bucketName in @('Fantasy', 'ScienceFiction', 'Other')) {
+        $buckets[$bucketName] = @($buckets[$bucketName] | Sort-Object -Property (
+            @{ Expression = 'AuthorAverage'; Descending = $true },
+            @{ Expression = { $_.Author.ToUpperInvariant() }; Ascending = $true }
+        ))
+    }
+
+    $patterns = @{
+        1 = @('Fantasy', 'ScienceFiction', 'Fantasy', 'Other')
+        2 = @('ScienceFiction', 'Fantasy', 'Other', 'Fantasy')
+        3 = @('Fantasy', 'Other', 'Fantasy', 'ScienceFiction')
+        4 = @('Other', 'Fantasy', 'ScienceFiction', 'Fantasy')
+    }
+    $pattern = $patterns[$OrderNumber]
+    $positions = @{ Fantasy = 0; ScienceFiction = 0; Other = 0 }
+    $ranked = [System.Collections.Generic.List[object]]::new()
+    $rank = 1
+
+    while ($ranked.Count -lt $Authors.Count) {
+        $addedThisCycle = 0
+        foreach ($bucketName in $pattern) {
+            $position = $positions[$bucketName]
+            if ($position -ge $buckets[$bucketName].Count) {
+                continue
+            }
+
+            $author = $buckets[$bucketName][$position]
+            $author | Add-Member -NotePropertyName OverallRank -NotePropertyValue $rank -Force
+            [void]$ranked.Add($author)
+            $positions[$bucketName]++
+            $rank++
+            $addedThisCycle++
+        }
+
+        if ($addedThisCycle -eq 0) {
+            throw 'Author ranking made no progress; bucket state is inconsistent.'
+        }
+    }
+
+    return @($ranked)
+}
+
+function Get-SortedBookList {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object[]]$RankedAuthors
+    )
+
+    $allBooks = [System.Collections.Generic.List[object]]::new()
+    foreach ($author in $RankedAuthors) {
+        foreach ($book in $author.Books) {
+            $book | Add-Member -NotePropertyName OverallRank -NotePropertyValue $author.OverallRank -Force
+            $book | Add-Member -NotePropertyName AuthorAverage -NotePropertyValue $author.AuthorAverage -Force
+            $blockKey = if (-not [string]::IsNullOrWhiteSpace($book.SeriesName)) {
+                "series:$(Get-NormalizedSeriesKey -SeriesName ([string]$book.SeriesName))"
+            }
+            else {
+                "standalone:$($book.WorkKey)"
+            }
+            $blockSortName = if (-not [string]::IsNullOrWhiteSpace($book.SeriesName)) {
+                $book.SeriesName
+            }
+            else {
+                $book.Title
+            }
+            $book | Add-Member -NotePropertyName BlockKey -NotePropertyValue $blockKey -Force
+            $book | Add-Member -NotePropertyName BlockSortName -NotePropertyValue $blockSortName -Force
+            [void]$allBooks.Add($book)
+        }
+    }
+
+    foreach ($block in ($allBooks | Group-Object -Property { "$($_.AuthorId)|$($_.BlockKey)" })) {
+        $knownYears = @($block.Group | Where-Object { $null -ne $_.PublicationYear } | ForEach-Object { [int]$_.PublicationYear })
+        $earliestYear = if ($knownYears.Count -gt 0) {
+            ($knownYears | Measure-Object -Minimum).Minimum
+        }
+        else {
+            9999
+        }
+
+        foreach ($book in $block.Group) {
+            $book | Add-Member -NotePropertyName BlockEarliestYear -NotePropertyValue $earliestYear -Force
+            $book | Add-Member -NotePropertyName SeriesNumberSortKey -NotePropertyValue (
+                Get-SeriesNumberSortKey -SeriesNumber $book.SeriesNumber
+            ) -Force
+            $publicationYearSortKey = if ($null -ne $book.PublicationYear) {
+                [int]$book.PublicationYear
+            }
+            else {
+                9999
+            }
+            $book | Add-Member -NotePropertyName PublicationYearSortKey -NotePropertyValue $publicationYearSortKey -Force
+        }
+    }
+
+    return @($allBooks | Sort-Object -Property (
+        @{ Expression = 'OverallRank'; Ascending = $true },
+        @{ Expression = 'BlockEarliestYear'; Ascending = $true },
+        @{ Expression = { $_.BlockSortName.ToUpperInvariant() }; Ascending = $true },
+        @{ Expression = 'SeriesNumberSortKey'; Ascending = $true },
+        @{ Expression = 'PublicationYearSortKey'; Ascending = $true },
+        @{ Expression = { $_.Title.ToUpperInvariant() }; Ascending = $true }
+    ))
+}
+
+function Get-NextReadingDay {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [datetime]$Date
+    )
+
+    $candidate = $Date.Date
+    while ($candidate.DayOfWeek -in @([DayOfWeek]::Friday, [DayOfWeek]::Saturday)) {
+        $candidate = $candidate.AddDays(1)
+    }
+    return $candidate
+}
+
+function Get-ReadingCompletionDate {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [datetime]$Start,
+
+        [Parameter(Mandatory)]
+        [ValidateRange(1, [int]::MaxValue)]
+        [int]$ReadingDays
+    )
+
+    $date = Get-NextReadingDay -Date $Start
+    $daysCounted = 0
+    while ($daysCounted -lt $ReadingDays) {
+        if ($date.DayOfWeek -notin @([DayOfWeek]::Friday, [DayOfWeek]::Saturday)) {
+            $daysCounted++
+            if ($daysCounted -eq $ReadingDays) {
+                return $date
+            }
+        }
+        $date = $date.AddDays(1)
+    }
+
+    throw 'Reading-date calculation failed unexpectedly.'
+}
+
+function Get-SecondSundayAfter {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [datetime]$Date
+    )
+
+    $dayNumber = [int]$Date.DayOfWeek
+    $daysToNextSunday = (7 - $dayNumber) % 7
+    if ($daysToNextSunday -eq 0) {
+        $daysToNextSunday = 7
+    }
+    return $Date.Date.AddDays($daysToNextSunday + 7)
+}
+
+function Add-ReadingSchedule {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object[]]$Books
+    )
+
+    foreach ($book in $Books) {
+        $book | Add-Member -NotePropertyName EstimatedStartDate -NotePropertyValue $null -Force
+        $book | Add-Member -NotePropertyName EstimatedEndDate -NotePropertyValue $null -Force
+    }
+
+    if ($AuthorListOnly) {
+        Write-RunLog -Level INFO -Message 'Reading-date estimation skipped in author-list-only mode.'
+        return $Books
+    }
+
+    $nextStart = Get-NextReadingDay -Date $StartDate
+    $schedulingStopped = $false
+
+    foreach ($book in $Books) {
+        if ($schedulingStopped) {
+            continue
+        }
+
+        $readingDays = [int][math]::Ceiling([double]$book.Pages / $PagesPerReadingDay)
+        $completionDate = Get-ReadingCompletionDate -Start $nextStart -ReadingDays $readingDays
+        if ($completionDate.Year -ge $ScheduleCutoffYear) {
+            $schedulingStopped = $true
+            Write-RunLog -Level INFO -Message (
+                "Scheduling stopped before '$($book.Title)': estimated completion $($completionDate.ToString('yyyy-MM-dd')) reaches cutoff year $ScheduleCutoffYear."
+            )
+            continue
+        }
+
+        $book.EstimatedStartDate = $nextStart
+        $book.EstimatedEndDate = $completionDate
+        $nextStart = Get-SecondSundayAfter -Date $completionDate
+    }
+
+    return $Books
+}
+
+function Export-ReadingPlan {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object[]]$Books,
+
+        [Parameter(Mandatory)]
+        [string]$LiteralPath
+    )
+
+    $rows = foreach ($book in $Books) {
+        [pscustomobject][ordered]@{
+            'Overall Rank'                = [int]$book.OverallRank
+            'Author'                      = Protect-CsvText ([string]$book.Author)
+            'Genre'                       = Protect-CsvText ([string]$book.Genre)
+            'Author Average'              = Format-Decimal -Value $book.AuthorAverage -MaximumDecimals 3
+            'Title'                       = Protect-CsvText ([string]$book.Title)
+            'Series Name'                 = Protect-CsvText ([string]$book.SeriesName)
+            'Series Number'               = Protect-CsvText ([string]$book.SeriesNumber)
+            'Series Average'              = if ($null -ne $book.SeriesAverage) {
+                Format-Decimal -Value $book.SeriesAverage -MaximumDecimals 3
+            } else { '' }
+            'Publication Year'            = if ($null -ne $book.PublicationYear) { [int]$book.PublicationYear } else { '' }
+            'Pages'                       = if ($null -ne $book.Pages) { [int]$book.Pages } else { '' }
+            'Average book rating'         = Format-Decimal -Value $book.AverageRating -MaximumDecimals 2
+            'Review count'                = [long]$book.RatingCount
+            'Estimated Reading Start Date' = if ($null -ne $book.EstimatedStartDate) {
+                $book.EstimatedStartDate.ToString('yyyy-MM-dd', $script:InvariantCulture)
+            } else { '' }
+            'Estimated Reading End Date'  = if ($null -ne $book.EstimatedEndDate) {
+                $book.EstimatedEndDate.ToString('yyyy-MM-dd', $script:InvariantCulture)
+            } else { '' }
+        }
+    }
+
+    $parent = Split-Path -Parent $LiteralPath
+    if (-not (Test-Path -LiteralPath $parent -PathType Container)) {
+        [void](New-Item -ItemType Directory -Path $parent -Force)
+    }
+
+    $temporaryPath = Join-Path -Path $parent -ChildPath (
+        '.{0}.{1}.tmp' -f ([System.IO.Path]::GetFileName($LiteralPath)), ([guid]::NewGuid().ToString('N'))
+    )
+
+    try {
+        @($rows) | Export-Csv -LiteralPath $temporaryPath -NoTypeInformation -Encoding utf8BOM
+        [System.IO.File]::Move($temporaryPath, $LiteralPath, $true)
+    }
+    finally {
+        if (Test-Path -LiteralPath $temporaryPath -PathType Leaf) {
+            Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+# Main
+$InputCsv = (Resolve-Path -LiteralPath $InputCsv).Path
+$OutputCsv = Get-UnresolvedFullPath -Path $OutputCsv
+if ([string]::IsNullOrWhiteSpace($LogPath)) {
+    $LogPath = [System.IO.Path]::ChangeExtension($OutputCsv, '.log')
+}
+else {
+    $LogPath = Get-UnresolvedFullPath -Path $LogPath
+}
+
+if ([System.StringComparer]::OrdinalIgnoreCase.Equals($InputCsv, $OutputCsv)) {
+    throw 'InputCsv and OutputCsv must be different files.'
+}
+if ([System.StringComparer]::OrdinalIgnoreCase.Equals($InputCsv, $LogPath)) {
+    throw 'InputCsv and LogPath must be different files.'
+}
+if ([System.StringComparer]::OrdinalIgnoreCase.Equals($OutputCsv, $LogPath)) {
+    throw 'OutputCsv and LogPath must be different files.'
+}
+if ($AuthorListOnly -and $FullMetadataScan) {
+    throw 'AuthorListOnly and FullMetadataScan cannot be used together.'
+}
+
+$script:LogPath = $LogPath
+$logParent = Split-Path -Parent $script:LogPath
+if (-not (Test-Path -LiteralPath $logParent -PathType Container)) {
+    [void](New-Item -ItemType Directory -Path $logParent -Force)
+}
+
+$orderMatch = [regex]::Match($Order, '(?<number>[1-4])')
+$orderNumber = [int]$orderMatch.Groups['number'].Value
+$startedUtc = [datetime]::UtcNow
+
+try {
+    Write-RunLog -Level INFO -Message ('=' * 72)
+    Write-RunLog -Level INFO -Message "Run started. Input='$InputCsv'; Output='$OutputCsv'; Order=$orderNumber."
+    if ($AuthorListOnly) {
+        Write-RunLog -Level INFO -Message (
+            "Thresholds: rating >= $MinimumRating; ratings count >= $MinimumRatingsCount. Page counts and scheduling are disabled."
+        )
+    }
+    else {
+        Write-RunLog -Level INFO -Message (
+            "Thresholds: rating >= $MinimumRating; ratings count >= $MinimumRatingsCount; pages/day=$PagesPerReadingDay; cutoff year=$ScheduleCutoffYear."
+        )
+    }
+    $scanMode = if ($AuthorListOnly) {
+        'author-list only; no individual book pages, page counts, or reading dates'
+    }
+    elseif ($FullMetadataScan) {
+        'full book-detail scan'
+    }
+    else {
+        'prefiltered book-detail scan'
+    }
+    Write-RunLog -Level INFO -Message "Metadata scan mode: $scanMode. Caching is disabled."
+    Write-RunLog -Level INFO -Message (
+        "Author-list pagination has no fixed page limit. After processing a page, its next page is skipped when any listed book has fewer than $MinimumRatingsCount ratings, except for authors marked Include=Y."
+    )
+
+    New-GoodreadsHttpClient
+    $configs = Import-AuthorConfiguration -LiteralPath $InputCsv
+    Write-RunLog -Level INFO -Message "Loaded $($configs.Count) unique author configuration(s)."
+
+    $authorRecords = [System.Collections.Generic.List[object]]::new()
+    foreach ($config in $configs) {
+        try {
+            $authorRecord = Get-GoodreadsAuthorRecord -Config $config
+            [void]$authorRecords.Add($authorRecord)
+            Write-RunLog -Level INFO -Message "Collected $($authorRecord.Books.Count) canonical candidate work(s) for '$($authorRecord.Author)'."
+        }
+        catch {
+            Write-RunLog -Level ERROR -Message "Author ID $($config.AuthorId) failed and will be skipped: $($_.Exception.Message)"
+        }
+    }
+
+    if ($authorRecords.Count -eq 0) {
+        throw 'No author pages were collected successfully.'
+    }
+
+    $allUniqueBooks = @(
+        $authorRecords.Books |
+        Group-Object -Property BookId |
+        ForEach-Object { $_.Group[0] }
+    )
+
+    $detailCandidates = @(Get-DetailCandidateBookList -AuthorRecords @($authorRecords))
+    $detailByBookId = @{}
+    if ($AuthorListOnly) {
+        Write-RunLog -Level INFO -Message (
+            "Skipped individual detail pages for all $($allUniqueBooks.Count) canonical book(s)."
+        )
+    }
+    else {
+        $uniqueBooks = @(
+            $detailCandidates |
+            Group-Object -Property BookId |
+            ForEach-Object { $_.Group[0] }
+        )
+        $savedRequests = $allUniqueBooks.Count - $uniqueBooks.Count
+        Write-RunLog -Level INFO -Message (
+            "Author-list prefilter reduced detail-page candidates from $($allUniqueBooks.Count) to $($uniqueBooks.Count), avoiding $savedRequests request(s)."
+        )
+        $detailByBookId = Get-BookDetailMap -Books $uniqueBooks
+    }
+
+    $filteredAuthors = [System.Collections.Generic.List[object]]::new()
+    foreach ($authorRecord in $authorRecords) {
+        $filtered = Get-FilteredAuthorResult -AuthorRecord $authorRecord -DetailByBookId $detailByBookId
+        if ($null -ne $filtered) {
+            [void]$filteredAuthors.Add($filtered)
+            Write-RunLog -Level INFO -Message (
+                "'$($filtered.Author)' retained $($filtered.Books.Count) book(s); author average $($filtered.AuthorAverage)."
+            )
+        }
+    }
+
+    if ($filteredAuthors.Count -eq 0) {
+        throw 'No books survived filtering. Review the log for exclusions or Goodreads parsing failures.'
+    }
+
+    $rankedAuthors = Get-RankedAuthorList -Authors @($filteredAuthors) -OrderNumber $orderNumber
+    $sortedBooks = Get-SortedBookList -RankedAuthors $rankedAuthors
+    $scheduledBooks = Add-ReadingSchedule -Books $sortedBooks
+    Export-ReadingPlan -Books $scheduledBooks -LiteralPath $OutputCsv
+
+    $elapsed = [datetime]::UtcNow - $startedUtc
+    Write-RunLog -Level INFO -Message (
+        "Completed successfully: $($rankedAuthors.Count) author(s), $($scheduledBooks.Count) book(s), elapsed $($elapsed.ToString())."
+    )
+    foreach ($reason in ($script:ExclusionCounts.Keys | Sort-Object)) {
+        Write-RunLog -Level INFO -Message "Exclusions [$reason]: $($script:ExclusionCounts[$reason])"
+    }
+
+    Write-Output "Created reading plan: $OutputCsv"
+    Write-Output "Log file: $LogPath"
+}
+catch {
+    try {
+        Write-RunLog -Level ERROR -Message "Fatal error: $($_.Exception.Message)"
+    }
+    catch {
+        Write-Warning "Fatal error (logging also failed): $($_.Exception.Message)"
+    }
+    throw
+}
+finally {
+    if ($null -ne $script:HttpClient) {
+        $script:HttpClient.Dispose()
     }
 }
